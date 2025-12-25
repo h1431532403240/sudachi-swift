@@ -1,0 +1,73 @@
+name: Check Upstream Updates
+
+on:
+  # schedule:
+  #   - cron: '0 0 * * *'  
+  workflow_dispatch:  
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream sudachi.rs releases
+        id: check
+        run: |
+          # Get latest release from upstream
+          LATEST=$(curl -s https://api.github.com/repos/WorksApplications/sudachi.rs/releases/latest | jq -r '.tag_name')
+          echo "Latest upstream release: $LATEST"
+
+          # Get current version from our Cargo.toml
+          # Note: Currently using fork, so this check is informational only
+          CURRENT=$(grep '^version' rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Current version: $CURRENT"
+
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+
+          if [ "$LATEST" != "v$CURRENT" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create issue if update needed
+        if: steps.check.outputs.needs_update == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Upstream sudachi.rs ${process.env.LATEST} released`;
+            const body = `A new version of sudachi.rs has been released.
+
+            **Current version:** ${process.env.CURRENT}
+            **Latest version:** ${process.env.LATEST}
+
+            Please check if our iOS platform patches can be rebased onto the new version.
+
+            Upstream release: https://github.com/WorksApplications/sudachi.rs/releases/tag/${process.env.LATEST}
+            `;
+
+            // Check if issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-update'
+            });
+
+            const exists = issues.data.some(issue => issue.title === title);
+
+            if (!exists) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['upstream-update']
+              });
+            }
+        env:
+          LATEST: ${{ steps.check.outputs.latest }}
+          CURRENT: ${{ steps.check.outputs.current }}

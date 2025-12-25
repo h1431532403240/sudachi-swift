@@ -1,0 +1,25 @@
+[package]
+name = "sudachi-swift"
+version = "0.6.10"
+edition = "2021"
+license = "Apache-2.0"
+description = "Swift bindings for sudachi.rs Japanese morphological analyzer"
+repository = "https://github.com/user/sudachi-swift"
+
+[lib]
+crate-type = ["staticlib", "lib"]
+name = "sudachi_swift"
+
+[dependencies]
+# sudachi.rs is not published to crates.io, use fork with iOS platform support
+# Fork: https://github.com/h1431532403240/sudachi.rs (branch: feature/apple-embedded-platforms)
+# PR: https://github.com/WorksApplications/sudachi.rs/pull/308
+sudachi = { path = "../sudachi.rs/sudachi" }
+uniffi = "0.30"
+thiserror = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true

@@ -1,0 +1,4 @@
+[submodule "sudachi.rs"]
+	path = sudachi.rs
+	url = https://github.com/h1431532403240/sudachi.rs.git
+	branch = feature/apple-embedded-platforms

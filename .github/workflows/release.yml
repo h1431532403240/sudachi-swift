@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Version must be in format X.Y.Z (e.g., 0.1.0)"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Releasing version: $VERSION"
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust targets
+        run: |
+          rustup target add aarch64-apple-ios
+          rustup target add aarch64-apple-ios-sim
+          rustup target add x86_64-apple-ios
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install cargo-swift
+        run: cargo install cargo-swift
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # ===========================================
+      # Build Stable (iOS + macOS)
+      # ===========================================
+      - name: Use stable toolchain for build
+        run: rustup default stable
+
+      - name: Verify Rust targets
+        run: rustup target list --installed
+
+      - name: Build XCFramework (iOS + macOS)
+        run: |
+          cd rust
+          cargo swift package \
+            --platforms macos ios \
+            --name SudachiSwift \
+            --release \
+            --skip-toolchains-check
+
+      - name: Prepare stable release
+        run: |
+          cp -r rust/SudachiSwift/RustFramework.xcframework ./SudachiSwift.xcframework
+          zip -r SudachiSwift.xcframework.zip SudachiSwift.xcframework
+
+          CHECKSUM=$(swift package compute-checksum SudachiSwift.xcframework.zip)
+          echo "STABLE_CHECKSUM=$CHECKSUM" >> $GITHUB_ENV
+          echo "Stable checksum: $CHECKSUM"
+
+      # ===========================================
+      # Build Nightly (All Platforms) - May fail
+      # ===========================================
+      - name: Build XCFramework (All Platforms - Nightly)
+        id: nightly-build
+        continue-on-error: true
+        run: |
+          cd rust
+          # Clean previous build
+          rm -rf SudachiSwift
+
+          cargo +nightly -Z build-std swift package \
+            -p macos -p ios -p tvos -p visionos \
+            --name SudachiSwift \
+            --release \
+            --skip-toolchains-check
+
+      - name: Prepare nightly release
+        if: steps.nightly-build.outcome == 'success'
+        run: |
+          cp -r rust/SudachiSwift/RustFramework.xcframework ./SudachiSwift-nightly.xcframework
+          zip -r SudachiSwift-nightly.xcframework.zip SudachiSwift-nightly.xcframework
+
+          CHECKSUM=$(swift package compute-checksum SudachiSwift-nightly.xcframework.zip)
+          echo "NIGHTLY_CHECKSUM=$CHECKSUM" >> $GITHUB_ENV
+          echo "NIGHTLY_AVAILABLE=true" >> $GITHUB_ENV
+          echo "Nightly checksum: $CHECKSUM"
+
+      - name: Mark nightly as unavailable
+        if: steps.nightly-build.outcome != 'success'
+        run: |
+          echo "NIGHTLY_AVAILABLE=false" >> $GITHUB_ENV
+          echo "Nightly build failed, skipping nightly release"
+
+      # ===========================================
+      # Copy resources
+      # ===========================================
+      - name: Copy resources
+        run: |
+          mkdir -p Sources/SudachiSwift/Resources
+          cp sudachi.rs/resources/char.def Sources/SudachiSwift/Resources/
+          cp sudachi.rs/resources/unk.def Sources/SudachiSwift/Resources/
+          cp sudachi.rs/resources/rewrite.def Sources/SudachiSwift/Resources/
+          cp sudachi.rs/resources/sudachi.json Sources/SudachiSwift/Resources/
+
+      # ===========================================
+      # Create stable tag
+      # ===========================================
+      - name: Update Package.swift for stable release
+        run: |
+          sed -i '' "s/let version = \".*\"/let version = \"$VERSION\"/" Package.swift
+          sed -i '' "s/let checksum = \".*\"/let checksum = \"$STABLE_CHECKSUM\"/" Package.swift
+
+          echo "Updated Package.swift for stable:"
+          head -15 Package.swift
+
+      - name: Commit and tag stable release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add Package.swift Sources/SudachiSwift/Resources/
+          git commit -m "chore: release v$VERSION"
+          git tag "v$VERSION"
+          git push origin main --tags
+
+      # ===========================================
+      # Create nightly tag (if build succeeded)
+      # ===========================================
+      - name: Update Package.swift for nightly release
+        if: env.NIGHTLY_AVAILABLE == 'true'
+        run: |
+          # Update checksum and URL to point to nightly version
+          sed -i '' "s/let version = \".*\"/let version = \"$VERSION-nightly\"/" Package.swift
+          sed -i '' "s/let checksum = \".*\"/let checksum = \"$NIGHTLY_CHECKSUM\"/" Package.swift
+          sed -i '' "s/SudachiSwift.xcframework.zip/SudachiSwift-nightly.xcframework.zip/" Package.swift
+
+          echo "Updated Package.swift for nightly:"
+          head -15 Package.swift
+
+      - name: Commit and tag nightly release
+        if: env.NIGHTLY_AVAILABLE == 'true'
+        run: |
+          git add Package.swift
+          git commit -m "chore: release v$VERSION-nightly"
+          git tag "v$VERSION-nightly"
+          git push origin main --tags
+
+      # ===========================================
+      # Restore Package.swift to stable (keep main stable)
+      # ===========================================
+      - name: Restore Package.swift to stable
+        if: env.NIGHTLY_AVAILABLE == 'true'
+        run: |
+          sed -i '' "s/let version = \".*\"/let version = \"$VERSION\"/" Package.swift
+          sed -i '' "s/let checksum = \".*\"/let checksum = \"$STABLE_CHECKSUM\"/" Package.swift
+          sed -i '' "s/SudachiSwift-nightly.xcframework.zip/SudachiSwift.xcframework.zip/" Package.swift
+
+          git add Package.swift
+          git commit -m "chore: restore Package.swift to stable after nightly tag"
+          git push origin main
+
+      # ===========================================
+      # Create GitHub Release
+      # ===========================================
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          files: |
+            SudachiSwift.xcframework.zip
+            SudachiSwift-nightly.xcframework.zip
+          fail_on_unmatched_files: false
+          body: |
+            ## SudachiSwift v${{ env.VERSION }}
+
+            Swift bindings for sudachi.rs Japanese morphological analyzer.
+
+            ### Installation
+
+            **Stable (iOS + macOS):**
+            ```swift
+            .package(url: "https://github.com/${{ github.repository }}", from: "${{ env.VERSION }}")
+            ```
+
+            **Nightly (iOS, macOS, tvOS, visionOS):**
+            ```swift
+            .package(url: "https://github.com/${{ github.repository }}", exact: "${{ env.VERSION }}-nightly")
+            ```
+            > ⚠️ Nightly builds use Rust nightly compiler and may be unstable
+
+            ### Checksums
+            - Stable: `${{ env.STABLE_CHECKSUM }}`
+            - Nightly: `${{ env.NIGHTLY_CHECKSUM }}`
+
+          generate_release_notes: true
