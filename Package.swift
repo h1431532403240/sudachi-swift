@@ -5,8 +5,8 @@ import PackageDescription
 
 // IMPORTANT: These values are automatically updated by the release workflow.
 // Do not modify manually unless you know what you're doing.
-let version = "0.1.0-nightly"
-let checksum = "d196a2688f1f90a2d64821329a920465c04a95496531b8f1bdf676370cd00322"
+let version = "0.1.0"
+let checksum = "64f855a42615157998c285587096a2fe0dd0ca9331188560188b28db8451dfd7"
 
 let package = Package(
     name: "SudachiSwift",
@@ -36,7 +36,7 @@ let package = Package(
         ),
         .binaryTarget(
             name: "SudachiSwiftFFI",
-            url: "https://github.com/h1431532403240/sudachi-swift/releases/download/v\(version)/SudachiSwift-nightly.xcframework.zip",
+            url: "https://github.com/h1431532403240/sudachi-swift/releases/download/v\(version)/SudachiSwift.xcframework.zip",
             checksum: checksum
         ),
     ]
