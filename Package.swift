@@ -6,7 +6,7 @@ import PackageDescription
 // IMPORTANT: These values are automatically updated by the release workflow.
 // Do not modify manually unless you know what you're doing.
 let version = "0.1.0"
-let checksum = "PLACEHOLDER_CHECKSUM"
+let checksum = "64f855a42615157998c285587096a2fe0dd0ca9331188560188b28db8451dfd7"
 
 let package = Package(
     name: "SudachiSwift",
