@@ -6,8 +6,8 @@ import PackageDescription
 
 // IMPORTANT: These values are automatically updated by the release workflow.
 // Do not modify manually unless you know what you're doing.
-let version = "0.6.11-nightly"
-let checksum = "a429ef9fe640506c6b6e66d8504dc7bccded0e1911d30b4941edc507775764df"
+let version = "0.6.11"
+let checksum = "8db8a6b49f355b91e8dbf46555e33ebf40ad50c86722b268e6fcdeb462b3cbaf"
 
 // Local development uses an XCFramework staged at the repo root by
 // scripts/build-local.sh; published releases download the prebuilt zip
@@ -23,7 +23,7 @@ let ffiTarget: Target = FileManager.default.fileExists(atPath: localXCFramework)
     )
     : .binaryTarget(
         name: "SudachiSwiftFFI",
-        url: "https://github.com/h1431532403240/sudachi-swift/releases/download/v\(version)/SudachiSwift-nightly.xcframework.zip",
+        url: "https://github.com/h1431532403240/sudachi-swift/releases/download/v\(version)/SudachiSwift.xcframework.zip",
         checksum: checksum
     )
 
