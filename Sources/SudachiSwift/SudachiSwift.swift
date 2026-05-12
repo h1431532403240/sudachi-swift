@@ -69,6 +69,31 @@ private class BundleToken {}
 extension Tokenizer {
     /// Create a tokenizer using the bundled char.def / unk.def / sudachi.json
     /// resources, so callers only need to provide their `.dic` file.
+    ///
+    /// ## Getting a `.dic`
+    ///
+    /// The dictionary file itself ships separately from this package — it's
+    /// 50 MB – 1 GB depending on which distribution you pick. See
+    /// ``SudachiDictDistribution`` for download URLs and
+    /// ``SudachiDictionaryStore`` for conventional install paths.
+    ///
+    /// **iOS / app bundle:** download a `sudachi-dictionary-*.zip` from
+    /// https://github.com/WorksApplications/SudachiDict on your dev machine,
+    /// extract the `.dic`, drag it into your Xcode target's *Copy Bundle
+    /// Resources* build phase, and read it via `Bundle.main.url(forResource:)`.
+    ///
+    /// **Runtime download:** fetch ``SudachiDictDistribution/downloadURL(version:)``
+    /// with `URLSession`, extract the zip with a library such as
+    /// [ZIPFoundation](https://github.com/weichsel/ZIPFoundation), and place
+    /// the resulting `.dic` at ``SudachiDictionaryStore/dictionaryPath(for:in:)``.
+    /// This package does not bundle a zip extractor — `FileManager.unzipItem`
+    /// doesn't exist on iOS, so leaving the choice to the caller keeps the
+    /// dependency surface clean.
+    ///
+    /// - Parameters:
+    ///   - dictionaryPath: Absolute path to a system `.dic` file.
+    ///   - userDictionaryPaths: Optional user dictionaries, applied in order
+    ///     (mirrors `userDict` in `sudachi.json`).
     public static func create(
         dictionaryPath: String,
         userDictionaryPaths: [String] = []
@@ -82,20 +107,39 @@ extension Tokenizer {
     }
 }
 
-// MARK: - SudachiDict distribution helpers (Swift-only)
-//
-// These describe the SudachiDict release archives published at
-// https://github.com/WorksApplications/SudachiDict — they are unrelated to
-// the analyzer itself, so we keep them out of the FFI surface and provide
-// them as plain Swift values for app code that needs to download a dict.
+// MARK: - SudachiDict distribution helpers
 
-/// One of the three SudachiDict distributions.
+/// One of the three SudachiDict distributions published at
+/// https://github.com/WorksApplications/SudachiDict.
+///
+/// `.core` is the recommended default. Each case knows its approximate
+/// ``sizeMB``, conventional ``dicFilename`` inside the zip, and
+/// ``downloadURL(version:)`` for fetching the archive.
+///
+/// This type doesn't perform any I/O — the analyzer is decoupled from
+/// dictionary distribution so you can ship a `.dic` inside your app bundle,
+/// fetch one at runtime, or proxy through your own CDN. See
+/// ``Tokenizer/create(dictionaryPath:userDictionaryPaths:)`` for the recipes.
+///
+/// ```swift
+/// // Decide what you need
+/// let dist: SudachiDictDistribution = .core   // ~70 MB
+/// let zipURL = dist.downloadURL()
+///
+/// // ...download with URLSession, extract with a zip library...
+///
+/// // Then load it
+/// let tokenizer = try Tokenizer.create(
+///     dictionaryPath: SudachiDictionaryStore.dictionaryPath(for: dist).path
+/// )
+/// ```
 public enum SudachiDictDistribution: String, CaseIterable, CustomStringConvertible, Sendable {
     case small, core, full
 
     public var description: String { rawValue.capitalized }
 
-    /// Approximate compressed size, in megabytes.
+    /// Approximate compressed archive size, in megabytes. Useful for budgeting
+    /// downloads / UX progress.
     public var sizeMB: Int {
         switch self {
         case .small: return 50
@@ -104,10 +148,13 @@ public enum SudachiDictDistribution: String, CaseIterable, CustomStringConvertib
         }
     }
 
-    /// Conventional `.dic` filename inside the published zip.
+    /// Conventional name of the `.dic` file inside SudachiDict's published zip
+    /// (e.g. `"system_core.dic"`).
     public var dicFilename: String { "system_\(rawValue).dic" }
 
-    /// Download URL for a specific dictionary version, or the latest if nil.
+    /// URL of the `sudachi-dictionary-{version}-{distribution}.zip` archive on
+    /// SudachiDict's CDN. Pass a specific version like `"20241021"` to pin, or
+    /// leave `nil` for the latest published release.
     public func downloadURL(version: String? = nil) -> URL {
         let v = version ?? "latest"
         let host = "https://d2ej7fkh96fzlu.cloudfront.net/sudachidict"
@@ -117,12 +164,21 @@ public enum SudachiDictDistribution: String, CaseIterable, CustomStringConvertib
 
 // MARK: - Local dictionary discovery
 
-/// Convenience helpers for locating user-installed `.dic` files. The library
-/// itself doesn't download or extract zips — callers do that with
-/// `URLSession` and a zip library of their choice, then drop the resulting
-/// `.dic` somewhere these helpers can find it.
+/// Conventions for locating user-installed `.dic` files on disk.
+///
+/// This type performs no network or zip work — fetch a dictionary as
+/// described on ``SudachiDictDistribution``, then drop the extracted `.dic`
+/// at ``dictionaryPath(for:in:)`` (or anywhere ``findDictionary(in:)``
+/// searches: caller-supplied paths, ``defaultDirectory``, or
+/// `Bundle.main.resourceURL`).
+///
+/// ```swift
+/// // Quickest path once a .dic is somewhere visible:
+/// let tokenizer = try SudachiDictionaryStore.createTokenizer()
+/// ```
 public enum SudachiDictionaryStore {
-    /// Default install directory: `Application Support/SudachiSwift/`.
+    /// Conventional install root: `~/Library/Application Support/SudachiSwift/`
+    /// on macOS, the equivalent sandboxed location on iOS.
     public static let defaultDirectory: URL = {
         let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
@@ -131,7 +187,8 @@ public enum SudachiDictionaryStore {
         return appSupport.appendingPathComponent("SudachiSwift")
     }()
 
-    /// Conventional install path for a distribution. The file may not exist yet.
+    /// Conventional install path for a distribution. The file may not exist
+    /// yet — write your extracted `.dic` here after fetching it.
     public static func dictionaryPath(
         for distribution: SudachiDictDistribution,
         in directory: URL = defaultDirectory
@@ -139,6 +196,7 @@ public enum SudachiDictionaryStore {
         directory.appendingPathComponent("system_\(distribution.rawValue).dic")
     }
 
+    /// `true` if a `.dic` for `distribution` exists at the conventional path.
     public static func isInstalled(
         _ distribution: SudachiDictDistribution,
         in directory: URL = defaultDirectory
@@ -146,8 +204,10 @@ public enum SudachiDictionaryStore {
         FileManager.default.fileExists(atPath: dictionaryPath(for: distribution, in: directory).path)
     }
 
-    /// Search caller-supplied paths, then `defaultDirectory`, then the host
-    /// app's main bundle, for any of the conventional `.dic` filenames.
+    /// Look for a `.dic` to load. Searches the caller-supplied paths first,
+    /// then ``defaultDirectory``, then `Bundle.main.resourceURL`. Recognised
+    /// filenames are `system.dic` plus the per-distribution names
+    /// (`system_small.dic`, `system_core.dic`, `system_full.dic`).
     public static func findDictionary(in additionalPaths: [URL] = []) -> URL? {
         var paths = additionalPaths
         paths.append(defaultDirectory)
@@ -166,7 +226,9 @@ public enum SudachiDictionaryStore {
         return nil
     }
 
-    /// Create a tokenizer using the first dictionary `findDictionary` returns.
+    /// Build a tokenizer from the first `.dic` ``findDictionary(in:)`` locates.
+    /// Throws ``SudachiError/DictionaryLoadError(message:)`` with an
+    /// actionable hint when no dictionary is installed.
     public static func createTokenizer() throws -> Tokenizer {
         guard let path = findDictionary() else {
             throw SudachiError.DictionaryLoadError(
