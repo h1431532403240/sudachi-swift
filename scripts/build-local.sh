@@ -40,6 +40,7 @@ for p in "${platform_arr[@]}"; do
     cargo_args+=(-p "$p")
 done
 
+echo "==> cargo swift package: ${cargo_cmd[*]} ${cargo_args[*]}"
 (
     cd rust
     "${cargo_cmd[@]}" "${cargo_args[@]}"
@@ -48,12 +49,13 @@ done
 GENERATED_BINDINGS="$CARGO_SWIFT_PKG/Sources/SudachiSwift/sudachi_swift.swift"
 GENERATED_XCFRAMEWORK="$CARGO_SWIFT_PKG/RustFramework.xcframework"
 
-if [ ! -f "$GENERATED_BINDINGS" ]; then
-    echo "error: expected generated bindings at $GENERATED_BINDINGS" >&2
-    exit 1
-fi
-if [ ! -d "$GENERATED_XCFRAMEWORK" ]; then
-    echo "error: expected XCFramework at $GENERATED_XCFRAMEWORK" >&2
+if [ ! -f "$GENERATED_BINDINGS" ] || [ ! -d "$GENERATED_XCFRAMEWORK" ]; then
+    echo "error: cargo-swift did not produce the expected layout."
+    echo "  cargo-swift version: $(cargo swift --version 2>&1 || echo '?')"
+    echo "  contents of $CARGO_SWIFT_PKG:"
+    find "$CARGO_SWIFT_PKG" -maxdepth 4 2>&1 || echo "  (missing)"
+    echo "  contents of rust/:"
+    ls -la rust/ 2>&1
     exit 1
 fi
 
