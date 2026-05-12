@@ -33,7 +33,7 @@ rm -rf "$CARGO_SWIFT_PKG"
 cargo_cmd=(cargo swift package)
 [ "$NIGHTLY" = "1" ] && cargo_cmd=(cargo +nightly -Z build-std swift package)
 
-cargo_args=(--name SudachiSwift --skip-toolchains-check -y)
+cargo_args=(--name SudachiSwift --xcframework-name RustFramework --skip-toolchains-check -y)
 [ "$PROFILE" = "release" ] && cargo_args+=(--release)
 read -ra platform_arr <<< "$PLATFORMS"
 for p in "${platform_arr[@]}"; do
