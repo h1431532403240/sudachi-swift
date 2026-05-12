@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g., 0.1.0)'
+        description: 'Version to release (e.g., 0.6.11)'
         required: true
         type: string
 
@@ -25,7 +25,7 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.version }}"
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Version must be in format X.Y.Z (e.g., 0.1.0)"
+            echo "Error: Version must be in format X.Y.Z (e.g., 0.6.11)"
             exit 1
           fi
           echo "VERSION=$VERSION" >> $GITHUB_ENV
@@ -62,23 +62,20 @@ jobs:
       - name: Use stable toolchain for build
         run: rustup default stable
 
-      - name: Verify Rust targets
-        run: rustup target list --installed
+      - name: Build stable XCFramework + stage bindings
+        run: ./scripts/build-local.sh
 
-      - name: Build XCFramework (iOS + macOS)
+      - name: Snapshot stable artifacts
+        # Nightly build below clobbers SudachiSwift.xcframework + the staged
+        # bindings; stash them so we can restore without a third build.
         run: |
-          cd rust
-          cargo swift package \
-            --platforms macos ios \
-            --name SudachiSwift \
-            --release \
-            --skip-toolchains-check
+          mkdir -p .stable-stash
+          cp -R SudachiSwift.xcframework .stable-stash/SudachiSwift.xcframework
+          cp Sources/SudachiSwift/sudachi_swift.swift .stable-stash/sudachi_swift.swift
 
-      - name: Prepare stable release
+      - name: Package stable XCFramework
         run: |
-          cp -r rust/SudachiSwift/RustFramework.xcframework ./SudachiSwift.xcframework
           zip -r SudachiSwift.xcframework.zip SudachiSwift.xcframework
-
           CHECKSUM=$(swift package compute-checksum SudachiSwift.xcframework.zip)
           echo "STABLE_CHECKSUM=$CHECKSUM" >> $GITHUB_ENV
           echo "Stable checksum: $CHECKSUM"
@@ -86,26 +83,19 @@ jobs:
       # ===========================================
       # Build Nightly (All Platforms) - May fail
       # ===========================================
-      - name: Build XCFramework (All Platforms - Nightly)
+      - name: Build nightly XCFramework (all platforms)
         id: nightly-build
         continue-on-error: true
-        run: |
-          cd rust
-          # Clean previous build
-          rm -rf SudachiSwift
+        env:
+          NIGHTLY: "1"
+          PLATFORMS: "macos ios tvos visionos"
+        run: ./scripts/build-local.sh
 
-          cargo +nightly -Z build-std swift package \
-            -p macos -p ios -p tvos -p visionos \
-            --name SudachiSwift \
-            --release \
-            --skip-toolchains-check
-
-      - name: Prepare nightly release
+      - name: Package nightly XCFramework
         if: steps.nightly-build.outcome == 'success'
         run: |
-          cp -r rust/SudachiSwift/RustFramework.xcframework ./SudachiSwift-nightly.xcframework
+          mv SudachiSwift.xcframework SudachiSwift-nightly.xcframework
           zip -r SudachiSwift-nightly.xcframework.zip SudachiSwift-nightly.xcframework
-
           CHECKSUM=$(swift package compute-checksum SudachiSwift-nightly.xcframework.zip)
           echo "NIGHTLY_CHECKSUM=$CHECKSUM" >> $GITHUB_ENV
           echo "NIGHTLY_AVAILABLE=true" >> $GITHUB_ENV
@@ -117,16 +107,12 @@ jobs:
           echo "NIGHTLY_AVAILABLE=false" >> $GITHUB_ENV
           echo "Nightly build failed, skipping nightly release"
 
-      # ===========================================
-      # Copy resources
-      # ===========================================
-      - name: Copy resources
+      - name: Restore stable artifacts from snapshot
+        if: env.NIGHTLY_AVAILABLE == 'true'
         run: |
-          mkdir -p Sources/SudachiSwift/Resources
-          cp sudachi.rs/resources/char.def Sources/SudachiSwift/Resources/
-          cp sudachi.rs/resources/unk.def Sources/SudachiSwift/Resources/
-          cp sudachi.rs/resources/rewrite.def Sources/SudachiSwift/Resources/
-          cp sudachi.rs/resources/sudachi.json Sources/SudachiSwift/Resources/
+          rm -rf SudachiSwift.xcframework
+          cp -R .stable-stash/SudachiSwift.xcframework SudachiSwift.xcframework
+          cp .stable-stash/sudachi_swift.swift Sources/SudachiSwift/sudachi_swift.swift
 
       # ===========================================
       # Create stable tag
@@ -137,14 +123,16 @@ jobs:
           sed -i '' "s/let checksum = \".*\"/let checksum = \"$STABLE_CHECKSUM\"/" Package.swift
 
           echo "Updated Package.swift for stable:"
-          head -15 Package.swift
+          head -20 Package.swift
 
       - name: Commit and tag stable release
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add Package.swift Sources/SudachiSwift/Resources/
+          git add Package.swift \
+                  Sources/SudachiSwift/Resources/ \
+                  Sources/SudachiSwift/sudachi_swift.swift
           git commit -m "chore: release v$VERSION"
           git tag "v$VERSION"
           git push origin main --tags
@@ -155,18 +143,17 @@ jobs:
       - name: Update Package.swift for nightly release
         if: env.NIGHTLY_AVAILABLE == 'true'
         run: |
-          # Update checksum and URL to point to nightly version
           sed -i '' "s/let version = \".*\"/let version = \"$VERSION-nightly\"/" Package.swift
           sed -i '' "s/let checksum = \".*\"/let checksum = \"$NIGHTLY_CHECKSUM\"/" Package.swift
           sed -i '' "s/SudachiSwift.xcframework.zip/SudachiSwift-nightly.xcframework.zip/" Package.swift
 
           echo "Updated Package.swift for nightly:"
-          head -15 Package.swift
+          head -20 Package.swift
 
       - name: Commit and tag nightly release
         if: env.NIGHTLY_AVAILABLE == 'true'
         run: |
-          git add Package.swift
+          git add Package.swift Sources/SudachiSwift/sudachi_swift.swift
           git commit -m "chore: release v$VERSION-nightly"
           git tag "v$VERSION-nightly"
           git push origin main --tags

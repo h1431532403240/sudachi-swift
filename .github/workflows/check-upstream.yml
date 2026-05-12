@@ -1,9 +1,13 @@
 name: Check Upstream Updates
 
 on:
-  # schedule:
-  #   - cron: '0 0 * * *'  
-  workflow_dispatch:  
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   check-upstream:
@@ -11,63 +15,67 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-      - name: Check upstream sudachi.rs releases
+      - name: Resolve latest upstream tag
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Get latest release from upstream
-          LATEST=$(curl -s https://api.github.com/repos/WorksApplications/sudachi.rs/releases/latest | jq -r '.tag_name')
+          LATEST=$(gh api repos/WorksApplications/sudachi.rs/releases/latest --jq '.tag_name')
           echo "Latest upstream release: $LATEST"
 
-          # Get current version from our Cargo.toml
-          # Note: Currently using fork, so this check is informational only
-          CURRENT=$(grep '^version' rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "Current version: $CURRENT"
+          CURRENT_SHA=$(git -C sudachi.rs rev-parse HEAD)
+          LATEST_SHA=$(git -C sudachi.rs rev-parse "refs/tags/${LATEST}" 2>/dev/null || true)
+
+          if [ -z "$LATEST_SHA" ]; then
+            git -C sudachi.rs fetch origin --tags
+            LATEST_SHA=$(git -C sudachi.rs rev-parse "refs/tags/${LATEST}")
+          fi
+
+          CURRENT_VERSION=$(grep '^version' rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          LATEST_VERSION=${LATEST#v}
+
+          echo "Pinned submodule SHA: $CURRENT_SHA"
+          echo "Latest tag SHA: $LATEST_SHA"
+          echo "Wrapper Cargo.toml version: $CURRENT_VERSION"
 
           echo "latest=$LATEST" >> $GITHUB_OUTPUT
-          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
 
-          if [ "$LATEST" != "v$CURRENT" ]; then
+          if [ "$CURRENT_SHA" != "$LATEST_SHA" ] || [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
             echo "needs_update=true" >> $GITHUB_OUTPUT
           else
             echo "needs_update=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create issue if update needed
+      - name: Bump submodule to latest upstream tag
         if: steps.check.outputs.needs_update == 'true'
-        uses: actions/github-script@v7
+        run: |
+          git -C sudachi.rs fetch origin --tags
+          git -C sudachi.rs checkout "${{ steps.check.outputs.latest }}"
+
+          # Sync wrapper Cargo.toml version to upstream
+          sed -i "s/^version = \".*\"/version = \"${{ steps.check.outputs.latest_version }}\"/" rust/Cargo.toml
+
+      - name: Open PR with submodule bump
+        if: steps.check.outputs.needs_update == 'true'
+        uses: peter-evans/create-pull-request@v6
         with:
-          script: |
-            const title = `Upstream sudachi.rs ${process.env.LATEST} released`;
-            const body = `A new version of sudachi.rs has been released.
+          branch: chore/bump-sudachi-${{ steps.check.outputs.latest_version }}
+          commit-message: "chore: bump sudachi.rs to ${{ steps.check.outputs.latest }}"
+          title: "chore: bump sudachi.rs to ${{ steps.check.outputs.latest }}"
+          labels: upstream-update
+          body: |
+            Upstream sudachi.rs released **${{ steps.check.outputs.latest }}**.
 
-            **Current version:** ${process.env.CURRENT}
-            **Latest version:** ${process.env.LATEST}
+            - Bumps the `sudachi.rs` submodule to tag `${{ steps.check.outputs.latest }}`
+            - Syncs `rust/Cargo.toml` version `${{ steps.check.outputs.current_version }}` → `${{ steps.check.outputs.latest_version }}`
 
-            Please check if our iOS platform patches can be rebased onto the new version.
+            If CI passes, merging this and triggering the `Release` workflow will publish
+            `v${{ steps.check.outputs.latest_version }}` of SudachiSwift.
 
-            Upstream release: https://github.com/WorksApplications/sudachi.rs/releases/tag/${process.env.LATEST}
-            `;
-
-            // Check if issue already exists
-            const issues = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'upstream-update'
-            });
-
-            const exists = issues.data.some(issue => issue.title === title);
-
-            if (!exists) {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: title,
-                body: body,
-                labels: ['upstream-update']
-              });
-            }
-        env:
-          LATEST: ${{ steps.check.outputs.latest }}
-          CURRENT: ${{ steps.check.outputs.current }}
+            Release notes: https://github.com/WorksApplications/sudachi.rs/releases/tag/${{ steps.check.outputs.latest }}

@@ -186,24 +186,51 @@ swift run
 
 ## Development
 
-This project uses a fork of sudachi.rs with iOS platform support:
-- Fork: https://github.com/h1431532403240/sudachi.rs
-- PR: https://github.com/WorksApplications/sudachi.rs/pull/308
+This project tracks the official [sudachi.rs](https://github.com/WorksApplications/sudachi.rs) repository as a git submodule. Apple platform support landed upstream in [v0.6.11](https://github.com/WorksApplications/sudachi.rs/releases/tag/v0.6.11) via [PR #308](https://github.com/WorksApplications/sudachi.rs/pull/308).
 
-### Building from Source
+### Repository layout
+
+```
+rust/                          # Rust wrapper crate (UniFFI)
+├── Cargo.toml
+└── src/lib.rs
+
+sudachi.rs/                    # Git submodule pinned to an upstream tag
+Sources/SudachiSwift/          # The Swift package shipped to consumers
+├── SudachiSwift.swift         # Hand-written extensions
+├── sudachi_swift.swift        # UniFFI-generated bindings (committed by release.yml)
+└── Resources/                 # Sudachi runtime data (char.def, sudachi.json, ...)
+
+Package.swift                  # Single SPM manifest, used by both external
+                               # consumers and local contributors
+scripts/build-local.sh         # Produces the XCFramework + bindings locally
+```
+
+### Building from source
 
 ```bash
-# Clone with submodule
+# 1. Clone with submodule
 git clone --recursive https://github.com/h1431532403240/sudachi-swift
+cd sudachi-swift
 
-# Build XCFramework
-cd rust
-cargo swift package --platforms macos ios --name SudachiSwift --release
+# 2. Build the Rust XCFramework + stage the UniFFI Swift bindings
+./scripts/build-local.sh
+
+# 3. Use the package — root Package.swift auto-detects the local XCFramework
+swift build
+cd Examples/BasicUsage && swift run BasicUsage
 ```
+
+`scripts/build-local.sh` runs `cargo swift package`, then copies
+`sudachi_swift.swift` into `Sources/SudachiSwift/` and the XCFramework into
+`SudachiSwift.xcframework/`. The root `Package.swift` picks the local
+XCFramework when it exists and falls back to the published release zip
+otherwise, so the same manifest serves both contributors and external
+SPM users.
 
 ### Version Synchronization
 
-Currently using independent versioning (starting at 0.1.0) while waiting for upstream to merge iOS platform support ([PR #308](https://github.com/WorksApplications/sudachi.rs/pull/308)). Once merged, versions will sync with [sudachi.rs releases](https://github.com/WorksApplications/sudachi.rs/releases).
+SudachiSwift's version mirrors the pinned upstream sudachi.rs tag. The `Check Upstream Updates` workflow runs daily and opens a PR that bumps the `sudachi.rs` submodule and `rust/Cargo.toml` version whenever a new upstream release ships.
 
 ## License
 

@@ -34,56 +34,45 @@ jobs:
         with:
           workspaces: rust
 
-      - name: Build XCFramework (iOS + macOS)
+      - name: Build XCFramework + stage bindings (macOS + iOS)
+        run: ./scripts/build-local.sh
+
+      - name: Verify root Package.swift via SPM consumer fixture
+        # Builds tests/spm-consumer/ against root Package.swift with a local
+        # binaryTarget. Catches the v0.1.0 class of bug where the package's
+        # binary surface is missing symbols an external SPM user would need.
         run: |
-          cd rust
-          cargo swift package \
-            -p macos -p ios \
-            --name SudachiSwift \
-            --release \
-            --skip-toolchains-check
+          set -euo pipefail
+          cp Package.swift Package.swift.bak
+          python3 -c "
+          import re, pathlib
+          p = pathlib.Path('Package.swift')
+          p.write_text(re.sub(
+              r'\.binaryTarget\(\s*name:\s*\"SudachiSwiftFFI\",[^)]*\)',
+              '.binaryTarget(name: \"SudachiSwiftFFI\", path: \"SudachiSwift.xcframework\")',
+              p.read_text(), count=1, flags=re.DOTALL))
+          "
+          ( cd tests/spm-consumer && swift build )
+          mv Package.swift.bak Package.swift
 
-      - name: Prepare Swift Package
+      - name: Verify iOS Simulator build
         run: |
-          # Restore git-committed files (Package.swift with resources, custom Swift files)
-          # cargo swift package overwrites the entire rust/SudachiSwift/ directory
-          git checkout -- rust/SudachiSwift/Package.swift
-          git checkout -- rust/SudachiSwift/Sources/SudachiSwift/SudachiSwift+Convenience.swift
-
-          # Copy resources from sudachi.rs
-          mkdir -p rust/SudachiSwift/Sources/SudachiSwift/Resources
-          cp sudachi.rs/resources/char.def rust/SudachiSwift/Sources/SudachiSwift/Resources/
-          cp sudachi.rs/resources/unk.def rust/SudachiSwift/Sources/SudachiSwift/Resources/
-          cp sudachi.rs/resources/rewrite.def rust/SudachiSwift/Sources/SudachiSwift/Resources/
-          cp sudachi.rs/resources/sudachi.json rust/SudachiSwift/Sources/SudachiSwift/Resources/
-
-          # Copy XCFramework to root
-          cp -r rust/SudachiSwift/RustFramework.xcframework ./SudachiSwift.xcframework
-
-      - name: Verify Swift Package (macOS)
-        run: |
-          cd rust/SudachiSwift
-          swift build
-
-      - name: Verify Swift Package (iOS Simulator)
-        run: |
-          cd rust/SudachiSwift
           xcodebuild build \
             -scheme SudachiSwift \
-            -destination 'platform=iOS Simulator,name=iPhone 15' \
+            -destination 'platform=iOS Simulator,name=iPhone 17' \
             -skipPackagePluginValidation
 
-      - name: Upload XCFramework
+      - name: Upload XCFramework artifact
         uses: actions/upload-artifact@v4
         with:
           name: SudachiSwift.xcframework
           path: SudachiSwift.xcframework
 
-      - name: Upload Swift Package (for testing)
+      - name: Upload staged bindings
         uses: actions/upload-artifact@v4
         with:
-          name: SudachiSwift-Package
-          path: rust/SudachiSwift
+          name: SudachiSwift-bindings
+          path: Sources/SudachiSwift/sudachi_swift.swift
 
   build-tier3:
     runs-on: macos-14
@@ -110,39 +99,16 @@ jobs:
           workspaces: rust
 
       - name: Build XCFramework (All Platforms)
-        run: |
-          cd rust
-          cargo +nightly -Z build-std swift package \
-            -p macos -p ios -p tvos -p visionos \
-            --name SudachiSwift \
-            --release \
-            --skip-toolchains-check
-
-      - name: Prepare Swift Package
-        run: |
-          # Restore git-committed files (Package.swift with resources, custom Swift files)
-          git checkout -- rust/SudachiSwift/Package.swift
-          git checkout -- rust/SudachiSwift/Sources/SudachiSwift/SudachiSwift+Convenience.swift
-
-          # Copy resources from sudachi.rs
-          mkdir -p rust/SudachiSwift/Sources/SudachiSwift/Resources
-          cp sudachi.rs/resources/char.def rust/SudachiSwift/Sources/SudachiSwift/Resources/
-          cp sudachi.rs/resources/unk.def rust/SudachiSwift/Sources/SudachiSwift/Resources/
-          cp sudachi.rs/resources/rewrite.def rust/SudachiSwift/Sources/SudachiSwift/Resources/
-          cp sudachi.rs/resources/sudachi.json rust/SudachiSwift/Sources/SudachiSwift/Resources/
+        env:
+          NIGHTLY: "1"
+          PLATFORMS: "macos ios tvos visionos"
+        run: ./scripts/build-local.sh
 
       - name: Upload Tier 3 XCFramework
         uses: actions/upload-artifact@v4
         with:
           name: SudachiSwift-Tier3.xcframework
-          path: rust/SudachiSwift/RustFramework.xcframework
-          if-no-files-found: ignore
-
-      - name: Upload Tier 3 Swift Package
-        uses: actions/upload-artifact@v4
-        with:
-          name: SudachiSwift-Tier3-Package
-          path: rust/SudachiSwift
+          path: SudachiSwift.xcframework
           if-no-files-found: ignore
 
   test:
@@ -154,32 +120,30 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Download Swift Package
+      - name: Download XCFramework artifact
         uses: actions/download-artifact@v4
         with:
-          name: SudachiSwift-Package
-          path: rust/SudachiSwift
+          name: SudachiSwift.xcframework
+          path: SudachiSwift.xcframework
+
+      - name: Download Swift bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: SudachiSwift-bindings
+          path: Sources/SudachiSwift
 
       - name: Download test dictionary
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Get latest release tag using gh CLI (authenticated)
           LATEST_TAG=$(gh api repos/WorksApplications/SudachiDict/releases/latest --jq '.tag_name')
           VERSION=${LATEST_TAG#v}
           echo "Downloading SudachiDict $VERSION (tag: $LATEST_TAG)"
           curl -L -o dict.zip "https://github.com/WorksApplications/SudachiDict/releases/download/${LATEST_TAG}/sudachi-dictionary-${VERSION}-small.zip"
           unzip -o dict.zip
           find . -name "*.dic" -type f | head -1 | xargs -I {} cp {} system.dic
-          ls -la system.dic
 
-      - name: Test with Example project
+      - name: Run BasicUsage example
         run: |
           cd Examples/BasicUsage
-          # Build the example
-          swift build
-          # Run with dictionary path
-          SUDACHI_DICT_PATH="../../system.dic" swift run BasicUsage 2>&1 || {
-            echo "Runtime test skipped (may need interactive input)"
-            exit 0
-          }
+          SUDACHI_DICT_PATH="../../system.dic" swift run BasicUsage

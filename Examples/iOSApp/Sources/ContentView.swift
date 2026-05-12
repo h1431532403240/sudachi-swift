@@ -55,7 +55,7 @@ struct ContentView: View {
 
             To use this demo:
             1. Download a dictionary from:
-               \(getDictionaryDownloadUrl(dictType: .small, version: nil))
+               \(SudachiDictDistribution.small.downloadURL())
             2. Extract the .dic file
             3. Copy it to the app's Documents folder as "system.dic"
             """
