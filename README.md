@@ -38,13 +38,13 @@ dependencies: [
 ]
 ```
 
-Or in Xcode: **File → Add Package Dependencies…**, paste the repository URL, and set **Dependency Rule** to **Exact Version** `0.7.0`.
+Or in Xcode: **File → Add Package Dependencies…**, paste the repository URL, and set **Dependency Rule** to **Exact Version** with the version shown above.
 
-Pin the exact version. SudachiSwift versions follow sudachi.rs, and upstream calls 0.7.x an intermediate series before 1.0 in which "breaking behavioral changes may be introduced even in patch releases". SPM's `from:` allows every version below the next major, which for a 0.x package means every later 0.x minor. For example, `from: "0.6.11"` already resolves to 0.7.0. If you're fine with patch-level behavior changes, use `.upToNextMinor(from: "0.7.0")` instead.
+Pin the exact version. SudachiSwift versions follow sudachi.rs, and upstream calls 0.7.x an intermediate series before 1.0 in which "breaking behavioral changes may be introduced even in patch releases". SPM's `from:` and Xcode's default **Up to Next Major Version** rule both allow every version below the next major, which for a 0.x package means every later 0.x minor. For example, `from: "0.6.11"` already resolves to 0.7.0, and so does Up to Next Major Version from 0.6.11. If you're fine with patch-level behavior changes, use `.upToNextMinor(from: "0.7.0")` (Xcode: **Up to Next Minor Version**) instead.
 
 **Upgrading from 0.6.x?** 0.7.0 needs new dictionaries. See [Upgrading from 0.6.x](#upgrading-from-06x).
 
-For all Apple platforms (tvOS / visionOS via the Tier 3 nightly build):
+For tvOS / visionOS as well (Tier 3 targets via the Rust nightly build):
 
 ```swift
 dependencies: [
@@ -52,7 +52,7 @@ dependencies: [
 ]
 ```
 
-A nightly tag is published only when that release's nightly build succeeds. Check [Releases](https://github.com/h1431532403240/sudachi-swift/releases) for it.
+The `-nightly` tag is a separate prerelease, published only when that release's nightly build succeeds. Check [Releases](https://github.com/h1431532403240/sudachi-swift/releases) for it.
 
 SudachiSwift is distributed through Swift Package Manager only.
 
@@ -66,9 +66,10 @@ SudachiSwift is distributed through Swift Package Manager only.
 | `.core` (recommended) | ~77 MB | ~202 MB | https://d2ej7fkh96fzlu.cloudfront.net/sudachidict/v1/sudachi-dictionary-latest-core.zip |
 | `.full` | ~137 MB | ~331 MB | https://d2ej7fkh96fzlu.cloudfront.net/sudachidict/v1/sudachi-dictionary-latest-full.zip |
 
-Each zip contains `sudachi-dictionary-<version>/system_<distribution>.dic` (plus `LEGAL` and `LICENSE-2.0.txt`). `latest` redirects to the newest V1 release. Replace `latest` with a version such as `20260723` to pin one. Releases older than 20260723 exist only as V0 and don't load. The same goes for the zips under the old `/sudachidict/` path (without `/v1/`) and the ones attached to SudachiDict's GitHub releases.
+Each zip contains `sudachi-dictionary-<version>/system_<distribution>.dic` (plus `LEGAL` and `LICENSE-2.0.txt`). `latest` redirects to the newest V1 release. Replace `latest` with a version such as `20260723` to pin one. Prebuilt V1 dictionaries start at 20260723. Older prebuilt releases are V0 only and don't load, and their `/v1/` URLs return HTTP 404. The zips under the old `/sudachidict/` path (without `/v1/`) and the ones attached to SudachiDict's GitHub releases are V0 as well. Upstream publishes [V1 lexicon sources](https://d2ej7fkh96fzlu.cloudfront.net/sudachidict-raw/v1/) for 20260428 (and 20260723) if you need to build one yourself.
 
 ```swift
+import Foundation
 import SudachiSwift
 
 // Discover what to download
@@ -79,13 +80,22 @@ for dist in SudachiDictDistribution.allCases {
 let dist: SudachiDictDistribution = .core
 let dicURL = SudachiDictionaryStore.dictionaryPath(for: dist)  // .../Application Support/SudachiSwift/system_core.dic
 if !SudachiDictionaryStore.isInstalled(dist) {  // false when the file is missing or a V0 leftover
-    // Download dist.downloadURL() (or dist.downloadURL(version: "20260723")),
-    // extract system_core.dic from the zip, and move it to dicURL.
+    // Download dist.downloadURL() (or dist.downloadURL(version: "20260723"))
+    // and extract system_core.dic from the zip. Then move it into place:
+    let extracted = URL(fileURLWithPath: "/path/to/extracted/system_core.dic")
+    let fm = FileManager.default
+    try fm.createDirectory(at: dicURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if fm.fileExists(atPath: dicURL.path) {
+        try fm.removeItem(at: dicURL)  // e.g. a V0 file left over from SudachiSwift 0.6.x
+    }
+    try fm.moveItem(at: extracted, to: dicURL)
 }
 let tokenizer = try Tokenizer.create(dictionaryPath: dicURL.path)
 ```
 
-The library does not download or unzip on your behalf. Use `URLSession` and any zip library (e.g. ZIPFoundation). If a `.dic` came from somewhere else, check it with `dictionaryFormat(path:)` first (`.v1` is the only format this version loads). On a development machine with a clone of this repo, upstream's script does the download and extraction: `sh sudachi.rs/fetch_dictionary.sh 20260723 core v1` writes `./system.dic`, and an optional fourth argument verifies the zip's SHA-256.
+Nothing replaces an old file for you: the folder doesn't exist before the first install, and `moveItem` fails when a file is already at `dicURL`. Create the folder, then delete the old file before moving the new one in, as above. `FileManager.replaceItemAt` can do the delete and move in one step.
+
+The library does not download or unzip on your behalf. Use `URLSession` and any zip library (e.g. ZIPFoundation), and check the HTTP status before unzipping. If a `.dic` came from somewhere else, check it with `dictionaryFormat(path:)` first (`.v1` is the only format this version loads). On a development machine, upstream's script in the `sudachi.rs` submodule does the download and extraction. It needs a recursive clone of this repo (or `git submodule update --init` in an existing clone): `sh sudachi.rs/fetch_dictionary.sh 20260723 core v1` writes `./system.dic`, and an optional fourth argument verifies the zip's SHA-256.
 
 ## Usage
 
@@ -123,7 +133,7 @@ let nested = try tokenizer.tokenizeWithSubunits(
 )
 for entry in nested {
     let subs = entry.subunits.map(\.surface).joined(separator: "+")
-    print("\(entry.morpheme.surface) → \(subs)")  // "国家公務員 → 国家+公務+員", "は → は", ...
+    print("\(entry.morpheme.surface) → \(subs)")  // core dictionary: "国家公務員 → 国家+公務+員", "は → は", ...
 }
 ```
 
@@ -197,13 +207,13 @@ let tokenizer = try Tokenizer.create(
 )
 ```
 
-Mirrors the `userDict` array in `sudachi.json`. Entries get `dictionaryId` 1, 2, … in the order given. Each user dictionary must be a V1 dictionary built against this exact system `.dic` (same release and distribution). Otherwise loading throws `SudachiError.DictionaryLoadError` ("… not compatible with the system dictionary"). Build one with the sudachi.rs 0.7 CLI (`cargo install --locked --path sudachi.rs/sudachi-cli` from a recursive clone of this repo):
+Mirrors the `userDict` array in `sudachi.json`. Entries get `dictionaryId` 1, 2, … in the order given (after any `userDict` entries from a custom config file). Pass absolute paths: a relative path is resolved like the resource files (see [Advanced configuration](#advanced-configuration)), not against the system `.dic`'s folder. Each user dictionary must be a V1 dictionary built against this exact system `.dic` file: the check compares the system dictionary's signature, so the same release and distribution from another source (e.g. the PyPI `sudachidict_*` packages, a separate build) does not count. `sudachi dump <file> description <out>` shows a dictionary's Signature / Reference. Otherwise loading throws `SudachiError.DictionaryLoadError` ("… not compatible with the system dictionary"). Build one with the sudachi.rs 0.7 CLI (`cargo install --locked --path sudachi.rs/sudachi-cli` from a recursive clone of this repo):
 
 ```bash
 sudachi ubuild -s system_core.dic -o user.dic user.csv
 ```
 
-For the CSV format and for converting old user dictionaries, see Sudachi's [user dictionary migration guide](https://github.com/WorksApplications/Sudachi/blob/develop/docs/migrate_user_dictionary.md).
+For converting old user dictionaries, see Sudachi's [user dictionary migration guide](https://github.com/WorksApplications/Sudachi/blob/develop/docs/migrate_user_dictionary.md). The CSV format is in the [V1 user dictionary format reference](https://github.com/WorksApplications/Sudachi/blob/develop/docs/user_dict_v1.md). Both are in Japanese.
 
 ### Advanced configuration
 
@@ -218,37 +228,41 @@ let tokenizer = try Tokenizer(config: TokenizerConfig(
 ))
 ```
 
-`char.def` / `unk.def` / `rewrite.def` are resolved in sudachi.rs order: `resourcePath`, then the config's `path` field, then the directory containing `configPath`, then defaults built into sudachi.rs. The `.dic`'s own directory is not searched, so a custom `char.def` needs one of the first three. `Tokenizer.create` passes the bundled `SudachiResources.configPath` / `SudachiResources.resourceDirectory`. `Tokenizer.withDictionary(dictionaryPath:)` passes `nil` for both and runs on the built-in defaults, so a bare `.dic` is enough.
+`char.def` / `unk.def` / `rewrite.def` are resolved in sudachi.rs order: `resourcePath`, then the config's `path` field, then the directory containing `configPath`, then defaults built into sudachi.rs. The `.dic`'s own directory is not searched, so a custom `char.def` needs one of the first three. A `resourcePath` that doesn't exist, or lacks one of the files, is not an error: that file silently comes from the next location, in the end from the built-in defaults. `Tokenizer.create` passes the bundled `SudachiResources.configPath` / `SudachiResources.resourceDirectory`. `Tokenizer.withDictionary(dictionaryPath:)` passes `nil` for both and runs on the built-in defaults, so a bare `.dic` is enough.
+
+Relative dictionary paths (`dictionaryPath` and `userDictionaryPaths`) are looked up the same way: in `resourcePath`, the config's `path` field and the directory containing `configPath`, then in the current working directory. They are not resolved against the system `.dic`'s folder, so use absolute paths.
 
 ## Upgrading from 0.6.x
 
-SudachiSwift 0.7.0 moves to [sudachi.rs 0.7.0](https://github.com/WorksApplications/sudachi.rs/releases/tag/v0.7.0). Upstream's [migration guide](https://github.com/WorksApplications/sudachi.rs/blob/develop/docs/migration_guide.md) has the details. What changes for Swift users:
+SudachiSwift 0.7.0 moves to [sudachi.rs 0.7.0](https://github.com/WorksApplications/sudachi.rs/releases/tag/v0.7.0). Upstream's [migration guide](https://github.com/WorksApplications/sudachi.rs/blob/v0.7.0/docs/migration_guide.md) (Japanese) has the details. What changes for Swift users:
 
 **Package resolution**
 
-- `.package(url: …, from: "0.6.x")` moves to 0.7.0 on your next package update. To stay on 0.6, pin `exact: "0.6.11"`. To move, pin `exact: "0.7.0"` and replace your dictionaries at the same time.
+- `.package(url: …, from: "0.6.x")`, or Xcode's default **Up to Next Major Version** rule, moves to 0.7.0 on your next package update. To stay on 0.6, pin `exact: "0.6.11"` (Xcode: **Exact Version** 0.6.11). To move, pin the exact version shown under [Installation](#installation) and replace your dictionaries at the same time.
 
 **Dictionaries**
 
 - **V1 dictionaries only.** A V0 `.dic` (everything SudachiSwift 0.6.x loaded) now throws `SudachiError.DictionaryLoadError` saying it is a legacy V0 dictionary. `dictionaryFormat(path:)` returns `.v1`, `.legacyV0` or `.unknown` without loading the file.
 - **New download location.** `SudachiDictDistribution.downloadURL(version:)` now points at the `/sudachidict/v1/` CDN path. Update any hard-coded URL: the old path serves V0 files, and SudachiDict's GitHub releases no longer carry the dictionary zips. `sizeMB` now reports the V1 zip sizes (42 / 77 / 137).
-- **Re-download flows replace old files.** `SudachiDictionaryStore.isInstalled(_:in:)` returns `true` only for a V1 file, so a V0 file left from 0.6.x counts as not installed. `findDictionary(in:)` still returns any file it finds, and `createTokenizer()` then throws the V0 error.
+- **Delete old files before installing new ones.** `SudachiDictionaryStore.isInstalled(_:in:)` returns `true` only for a V1 file, so a V0 file left from 0.6.x counts as not installed and a "download if not installed" flow runs again. Nothing replaces the old file: create the folder if needed, then delete any file already at `dicURL` before moving the new `.dic` in (or use `FileManager.replaceItemAt`), as in [Dictionary Setup](#dictionary-setup). V0 files under other names stay on disk until you delete them. `findDictionary(in:)`, and so `createTokenizer()`, prefers V1 files and returns another match only when no V1 file exists, in which case `createTokenizer()` throws the V0 error.
 - **Rebuild user dictionaries.** They must be V1 and built against the exact system `.dic` you load them with. Do this again every time you update the system dictionary (see [Multiple user dictionaries](#multiple-user-dictionaries)).
-- **Custom `char.def`.** The `NOOOVBOW2` category was removed. Replace it with `NOOOVBOW NOOOVEOW`. The bundled `char.def` is already updated.
+- **Custom `char.def`.** The `NOOOVBOW2` category was removed. Replace it with `NOOOVBOW NOOOVEOW`. A `char.def` that still uses it fails to load with `SudachiError.DictionaryLoadError` ("Invalid character category definition: Invalid type NOOOVBOW2 at line …"). The bundled `char.def` is already updated.
 
 **API**
 
 - `MorphemeInfo.synonymGroupIds` is `[Int32]` (was `[UInt32]`).
 - `lookup(query:)` normalizes the query before searching (`"ＡＢＣ"` finds `abc`). Returned `surface` / offsets refer to the normalized query, not your input string.
 - Resources resolve in sudachi.rs order: `resourcePath`, then the config `path` field, then the config file's directory, then built-in defaults. The `.dic`'s directory is no longer searched, and `Tokenizer.withDictionary(dictionaryPath:)` now works with a bare `.dic` (see [Advanced configuration](#advanced-configuration)).
+- A `resourcePath` that doesn't exist, or lacks one of the files, no longer throws. The missing files silently fall back to the next location and, in the end, to the built-in defaults.
+- Relative `userDictionaryPaths` are resolved like resources (`resourcePath`, the config `path` field, the config file's directory, then the working directory), no longer against the system `.dic`'s folder. Use absolute paths.
 - New: `dictionaryFormat(path:)` and `DictionaryFormat`.
 
 **Analysis results**
 
 - POS ids and word ids are renumbered in V1 dictionaries. Don't persist `partOfSpeechId` / `wordId` across dictionary builds.
-- Upstream algorithm fixes can change segmentation for some inputs: minimum-cost path by total cost ([#323](https://github.com/WorksApplications/sudachi.rs/pull/323)), `NOOOVBOW` / `NOOOVEOW` handling ([#325](https://github.com/WorksApplications/sudachi.rs/pull/325)), and character-category run length ([#326](https://github.com/WorksApplications/sudachi.rs/pull/326)). Comparing 0.6.11 and 0.7.0 on the same dictionary release, surface, POS, and normalized / reading / dictionary forms were unchanged on the text we tried. Still, re-check any golden outputs.
+- Upstream algorithm fixes can change segmentation for some inputs: `NOOOVBOW` / `NOOOVEOW` handling ([#325](https://github.com/WorksApplications/sudachi.rs/pull/325)) and character-category run length ([#326](https://github.com/WorksApplications/sudachi.rs/pull/326)). Comparing 0.6.11 and 0.7.0 on the same dictionary release, surface, POS, and normalized / reading / dictionary forms were unchanged on the text we tried. Still, re-check any golden outputs.
 - Numbers joined by `JoinNumericPlugin` now carry an OOV-style `wordId` instead of `UInt32.max`, and numbers written with commas can get different readings.
-- Joined katakana out-of-vocabulary words can come back with a different `isOov` / `dictionaryId` / `wordId`.
+- `JoinKatakanaOovPlugin` now reuses an existing lattice node that covers the joined span, picking the one with the lowest node cost ([#323](https://github.com/WorksApplications/sudachi.rs/pull/323)), and otherwise marks the joined word as OOV. Joined katakana words can therefore come back with a different `isOov` / `dictionaryId` / `wordId` and, when a dictionary word is reused, with that word's part of speech and reading / normalized forms.
 
 ## API Reference
 
@@ -295,7 +309,7 @@ Each exposes `sizeMB` (approximate zip size), `dicFilename` (`system_<distributi
 
 ### `SudachiDictionaryStore`
 
-Pure Swift helpers for locating user-installed `.dic` files. `defaultDirectory` points at `Application Support/SudachiSwift/`, and `dictionaryPath(for:in:)` gives the conventional file path inside it. `isInstalled(_:in:)` is `true` only if a V1 dictionary exists at that path. `findDictionary(in:)` returns the first `system.dic` / `system_<distribution>.dic` in caller-supplied paths, the default directory, or the host app's main bundle, without checking its format. `createTokenizer()` loads that file, and throws `SudachiError.DictionaryLoadError` if none is found or the file is V0.
+Pure Swift helpers for locating user-installed `.dic` files. `defaultDirectory` points at `Application Support/SudachiSwift/`, and `dictionaryPath(for:in:)` gives the conventional file path inside it. Neither is created for you. `isInstalled(_:in:)` is `true` only if a V1 dictionary exists at that path. `findDictionary(in:)` looks for `system.dic` / `system_<distribution>.dic` in caller-supplied paths, then the default directory, then the host app's main bundle, and returns the first V1 file. Only when no V1 file exists does it return the first other match. `createTokenizer()` loads the file `findDictionary()` returns, and throws `SudachiError.DictionaryLoadError` if none is found or the file is V0.
 
 ## Examples
 
@@ -311,7 +325,7 @@ SUDACHI_DICT_PATH=/path/to/system.dic swift run BasicUsage
 
 ## Development
 
-The project pins the official [sudachi.rs](https://github.com/WorksApplications/sudachi.rs) repository as a git submodule, currently at [v0.7.0](https://github.com/WorksApplications/sudachi.rs/releases/tag/v0.7.0). Apple platforms support landed upstream in [v0.6.11](https://github.com/WorksApplications/sudachi.rs/releases/tag/v0.6.11) via [PR #308](https://github.com/WorksApplications/sudachi.rs/pull/308).
+The project pins the official [sudachi.rs](https://github.com/WorksApplications/sudachi.rs) repository as a git submodule, pinned to an upstream release tag (shown in the badge at the top). Apple platforms support landed upstream in [v0.6.11](https://github.com/WorksApplications/sudachi.rs/releases/tag/v0.6.11) via [PR #308](https://github.com/WorksApplications/sudachi.rs/pull/308).
 
 ### Repository layout
 
@@ -353,14 +367,24 @@ The root `Package.swift` auto-detects the local `SudachiSwift.xcframework` and f
 
 ### Version sync with upstream
 
-`.github/workflows/check-upstream.yml` runs daily. It can also be started by hand, with a `dry_run` option. When WorksApplications/sudachi.rs publishes a newer release, it:
+`.github/workflows/check-upstream.yml` runs daily. It can also be started by hand, with a `dry_run` option. It looks up the highest stable release of WorksApplications/sudachi.rs (by version number, not GitHub's "Latest" label). When that release is newer than the pinned submodule tag, the workflow:
 
+- runs `cargo check` of `rust/` against it in a read-only job,
 - opens a tracking issue assigned to the maintainer with the `cargo check` result, and
-- opens a PR from `automation/sudachi-rs-<tag>` that bumps the submodule, syncs the `rust/Cargo.toml` version, and refreshes the bundled resources. The PR is a draft when the bump is breaking (a new major, or a new minor while on 0.x) or when it doesn't compile.
+- opens a PR from `automation/sudachi-rs-<tag>` that bumps the submodule, syncs the `rust/Cargo.toml` version, refreshes the bundled resources and `rust/Cargo.lock`, and updates the `exact:` install pins (this README and the example manifests) plus the sudachi.rs badge. The PR is a draft when the bump is breaking (a new major, or a new minor while on 0.x) or when `rust/` doesn't compile.
 
-Closing the tracking issue skips that release. The workflow also opens an issue when the check itself fails, and a warning issue after ~45 days without repository activity, because GitHub disables scheduled workflows after 60.
+Each release is handled once. Once its tracking issue exists, open or closed, the workflow doesn't open another issue or PR for that release, and it never pushes to an existing bump branch, so migration commits you push there are safe. Close the issue to skip the release. When a newer release arrives while older tracking issues are still open, the new issue lists them and they get a "superseded" comment.
 
-Merging the PR doesn't publish anything. To ship, dispatch the **Release** workflow (`release.yml`) with the new version.
+Opening the PR needs one of these:
+
+- **Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests**, or
+- an `UPSTREAM_BOT_TOKEN` secret: a fine-grained personal access token for this repository with **Contents** and **Pull requests** read/write.
+
+Without the secret, the PR is opened with `GITHUB_TOKEN`, and its `pull_request` CI would wait for approval. The workflow therefore dispatches `build.yml` on the bump branch instead. With neither, the branch is still pushed and the tracking issue gets a comment with a compare link to open the PR by hand.
+
+The workflow also opens an issue when the check itself fails. It opens a warning issue once the last commit on the default branch is 45 or more days old, because GitHub disables scheduled workflows after 60 days without repository activity.
+
+Merging the PR publishes nothing. To ship, run the **Release** workflow (`release.yml`) from `main` with the new version. It stops unless the version equals `version` in `rust/Cargo.toml`, which the bump PR sets. The stable release is published right after its tag is pushed. When the Rust nightly build succeeds, a separate `<version>-nightly` prerelease follows; its tag is not on `main`.
 
 ## License
 
