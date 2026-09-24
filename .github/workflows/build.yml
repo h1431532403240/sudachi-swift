@@ -5,13 +5,24 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Lets the upstream-check automation run CI on its bump branch: pull_request
+  # runs for PRs opened with GITHUB_TOKEN wait for approval, but a dispatch
+  # sent with GITHUB_TOKEN starts a run right away.
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 is being retired (brownouts from 2026-10-05, removed 2026-11-02:
+    # https://github.com/actions/runner-images/issues/13518). macos-15 is the
+    # oldest supported image, so CI keeps covering the oldest Xcode it can
+    # (16.4 by default).
+    runs-on: macos-15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -26,13 +37,28 @@ jobs:
           rustup target add aarch64-apple-darwin
           rustup target add x86_64-apple-darwin
 
-      - name: Install cargo-swift
-        run: cargo install cargo-swift
-
       - name: Cache Rust dependencies
+        # Runs before the cargo-swift install: rust-cache leaves out anything
+        # already in ~/.cargo/bin when it starts, so this order lets the pinned
+        # cargo-swift be cached, and on later runs `cargo install` finds it
+        # already installed.
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+
+      - name: Install cargo-swift (version pinned in scripts/build-local.sh)
+        run: |
+          CARGO_SWIFT_VERSION=$(sed -n 's/^CARGO_SWIFT_VERSION="\([^"]*\)"$/\1/p' scripts/build-local.sh)
+          if [ -z "$CARGO_SWIFT_VERSION" ]; then
+            echo "::error file=scripts/build-local.sh::CARGO_SWIFT_VERSION not found"
+            exit 1
+          fi
+          cargo install cargo-swift --version "$CARGO_SWIFT_VERSION" --locked
+
+      - name: Run Rust unit tests
+        # Includes dictionary-format detection tests, which read
+        # sudachi.rs/sudachi/tests/resources from the submodule.
+        run: cargo test --manifest-path rust/Cargo.toml
 
       - name: Build XCFramework + stage bindings (macOS + iOS)
         run: ./scripts/build-local.sh
@@ -56,31 +82,35 @@ jobs:
           mv Package.swift.bak Package.swift
 
       - name: Verify iOS Simulator build
+        # A generic destination needs only the iOS Simulator SDK, not a
+        # particular simulated device, so it doesn't depend on which simulators
+        # the runner image ships. (There is no "iPhone 17" simulator on macos-14,
+        # or with macos-15's default Xcode 16.4.)
         run: |
           xcodebuild build \
             -scheme SudachiSwift \
-            -destination 'platform=iOS Simulator,name=iPhone 17' \
+            -destination 'generic/platform=iOS Simulator' \
             -skipPackagePluginValidation
 
       - name: Upload XCFramework artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SudachiSwift.xcframework
           path: SudachiSwift.xcframework
 
       - name: Upload staged bindings
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SudachiSwift-bindings
           path: Sources/SudachiSwift/sudachi_swift.swift
 
   build-tier3:
-    runs-on: macos-14
+    runs-on: macos-15
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     continue-on-error: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -90,13 +120,19 @@ jobs:
           components: rust-src
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Install cargo-swift
-        run: cargo install cargo-swift
-
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+
+      - name: Install cargo-swift (version pinned in scripts/build-local.sh)
+        run: |
+          CARGO_SWIFT_VERSION=$(sed -n 's/^CARGO_SWIFT_VERSION="\([^"]*\)"$/\1/p' scripts/build-local.sh)
+          if [ -z "$CARGO_SWIFT_VERSION" ]; then
+            echo "::error file=scripts/build-local.sh::CARGO_SWIFT_VERSION not found"
+            exit 1
+          fi
+          cargo install cargo-swift --version "$CARGO_SWIFT_VERSION" --locked
 
       - name: Build XCFramework (All Platforms)
         env:
@@ -105,45 +141,78 @@ jobs:
         run: ./scripts/build-local.sh
 
       - name: Upload Tier 3 XCFramework
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SudachiSwift-Tier3.xcframework
           path: SudachiSwift.xcframework
           if-no-files-found: ignore
 
   test:
-    runs-on: macos-14
+    runs-on: macos-15
     needs: build
+    env:
+      # Test dictionary, pinned by version + sha256 so a new SudachiDict upload
+      # can't change or break CI; bump all three values together.
+      # sudachi.rs 0.7+ reads only V1-format dictionaries, so the fixture must
+      # come from the V1 CDN path (the "v1" argument to fetch_dictionary.sh).
+      # (The old job looked up SudachiDict's latest GitHub release, but those
+      # releases no longer carry the dictionary zips.)
+      SUDACHI_DICT_VERSION: "20260723"
+      SUDACHI_DICT_V1_SHA256: f7778a7945ea653154fd61636ad42365f797cddf04123953c1fae1e897cd3b59
+      # Legacy V0 build of the same release, used only to check it is rejected.
+      SUDACHI_DICT_V0_SHA256: 4729d134fd0b9852dacc89c59229664fee40642bb52bafcf4efb432cee9bb22c
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
+          # Also provides sudachi.rs/fetch_dictionary.sh.
           submodules: recursive
 
       - name: Download XCFramework artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: SudachiSwift.xcframework
           path: SudachiSwift.xcframework
 
       - name: Download Swift bindings
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: SudachiSwift-bindings
           path: Sources/SudachiSwift
 
-      - name: Download test dictionary
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          LATEST_TAG=$(gh api repos/WorksApplications/SudachiDict/releases/latest --jq '.tag_name')
-          VERSION=${LATEST_TAG#v}
-          echo "Downloading SudachiDict $VERSION (tag: $LATEST_TAG)"
-          curl -L -o dict.zip "https://github.com/WorksApplications/SudachiDict/releases/download/${LATEST_TAG}/sudachi-dictionary-${VERSION}-small.zip"
-          unzip -o dict.zip
-          find . -name "*.dic" -type f | head -1 | xargs -I {} cp {} system.dic
+      - name: Download test dictionary (V1)
+        # Upstream's script downloads the zip, checks its sha256, and writes
+        # ./system.dic at the repo root, where BasicUsage's
+        # SUDACHI_DICT_PATH points.
+        run: sh sudachi.rs/fetch_dictionary.sh "$SUDACHI_DICT_VERSION" small v1 "$SUDACHI_DICT_V1_SHA256"
 
       - name: Run BasicUsage example
         run: |
           cd Examples/BasicUsage
           SUDACHI_DICT_PATH="../../system.dic" swift run BasicUsage
+
+      - name: Check that a legacy V0 dictionary is rejected
+        # A real V0 file must be refused up front with a "legacy V0" message
+        # (from BasicUsage's dictionaryFormat(path:) check or the library's
+        # DictionaryLoadError), not a confusing char.def/parse error. If upstream
+        # stops serving the V0 fixture, skip with a warning instead of failing CI
+        # for an unrelated reason.
+        run: |
+          mkdir -p dict-v0
+          if ! (cd dict-v0 && sh ../sudachi.rs/fetch_dictionary.sh "$SUDACHI_DICT_VERSION" small v0 "$SUDACHI_DICT_V0_SHA256"); then
+            echo "::warning::Could not fetch the V0 fixture dictionary; skipping the legacy-format check."
+            exit 0
+          fi
+          cd Examples/BasicUsage
+          status=0
+          SUDACHI_DICT_PATH="../../dict-v0/system.dic" swift run BasicUsage > ../../v0-run.log 2>&1 || status=$?
+          cat ../../v0-run.log
+          if [ "$status" -eq 0 ]; then
+            echo "::error::BasicUsage accepted a V0 dictionary; expected a 'legacy V0' error."
+            exit 1
+          fi
+          if ! grep -qF "legacy V0" ../../v0-run.log; then
+            echo "::error::BasicUsage failed on the V0 dictionary, but without the 'legacy V0' message."
+            exit 1
+          fi
+          echo "V0 dictionary rejected as expected."
