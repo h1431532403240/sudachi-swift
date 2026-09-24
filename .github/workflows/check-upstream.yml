@@ -58,7 +58,7 @@ jobs:
       compile: ${{ steps.check.outputs.compile }}
     # Upstream tags are validated (^v\d+\.\d+\.\d+$) before use and never interpolated into scripts.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           fetch-depth: 0
@@ -152,7 +152,7 @@ jobs:
           echo "compile=$COMPILE" >> "$GITHUB_OUTPUT"
 
       - if: steps.detect.outputs.new_release == 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: probe
           path: ${{ runner.temp }}/probe/
@@ -181,13 +181,13 @@ jobs:
       PROBE_SUPERSEDED: ${{ needs.probe.outputs.superseded }}
     # Steps share validated state via $GITHUB_ENV. GH_TOKEN is per step. Dry run: print, write nothing.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           fetch-depth: 0
           persist-credentials: false # no token in .git/config; create-pull-request brings its own
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: probe
           path: ${{ runner.temp }}/probe
@@ -309,6 +309,7 @@ jobs:
             else
               echo "- [ ] Update the README version pins by hand: no \`exact: \"$OLD\"\` install line was found"
             fi
+            echo "- [ ] Regenerate \`THIRD_PARTY_NOTICES.md\` (\`python3 scripts/generate-third-party-notices.py\`) (always needed for a bump: it records the \`sudachi.rs\` commit and the crate versions; build.yml's \`notices\` job fails until then)"
             echo "- [ ] Merge, then run the **Release** workflow with version \`$VERSION\`"
             echo
             if [ "$BRANCH_EXISTS" = true ]; then echo "Branch \`$BRANCH\` already exists, so no PR was opened (it is never overwritten)."; echo; fi
