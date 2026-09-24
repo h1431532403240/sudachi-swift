@@ -44,10 +44,11 @@ rm -rf "$CARGO_SWIFT_PKG"
 cargo_cmd=(cargo swift package)
 if [ "$NIGHTLY" = "1" ]; then
     # cargo-swift runs its own `cargo build` per target, and `cargo +nightly -Z
-    # build-std swift ...` doesn't reliably reach those (with nightly-2026-09-23
-    # the tvOS build ran without build-std: "can't find crate for `core`").
-    # The environment is inherited by every child cargo.
-    export RUSTUP_TOOLCHAIN=nightly
+    # build-std swift ...` doesn't reliably reach those (with rustc
+    # 1.100.0-nightly 6eeff9a52 2026-09-23 the tvOS build ran without
+    # build-std: "can't find crate for `core`"). The environment is inherited
+    # by every child cargo. RUST_NIGHTLY selects a pinned nightly (CI sets it).
+    export RUSTUP_TOOLCHAIN="${RUST_NIGHTLY:-nightly}"
     export CARGO_UNSTABLE_BUILD_STD=std,panic_abort
 fi
 
@@ -82,8 +83,32 @@ if [ ! -f "$GENERATED_BINDINGS" ] || [ ! -d "$GENERATED_XCFRAMEWORK" ]; then
     exit 1
 fi
 
-echo "==> Staging Swift bindings at Sources/SudachiSwift/sudachi_swift.swift"
-cp "$GENERATED_BINDINGS" Sources/SudachiSwift/sudachi_swift.swift
+STAGED_BINDINGS="Sources/SudachiSwift/sudachi_swift.swift"
+echo "==> Staging Swift bindings at $STAGED_BINDINGS"
+cp "$GENERATED_BINDINGS" "$STAGED_BINDINGS"
+
+# Keep a leading U+FEFF in strings returned from Rust. UniFFI's generated
+# FfiConverterString decodes with `String(bytes:encoding: .utf8)`, which
+# drops a leading BOM, so a morpheme or sentence that starts with U+FEFF came
+# back shorter than its byte offsets say (surface != utf8[begin..<end]).
+# `String(decoding:as: UTF8.self)` keeps every scalar; Rust strings are
+# always valid UTF-8, so its repair of invalid input never applies. The
+# expected count guards against a cargo-swift/uniffi bump changing the
+# generated code and silently skipping this.
+EXPECTED_STRING_DECODES=2
+echo "==> Patching $STAGED_BINDINGS to keep a leading BOM in strings from Rust"
+patched_decodes="$(perl -0777 -pi -e '
+    $n += s/String\(bytes: ((?:[^()]|(\((?:[^()]|(?2))*\)))*?), encoding: String\.Encoding\.utf8\)!/String(decoding: $1, as: UTF8.self)/g;
+    END { print STDOUT ($n || 0) }
+' "$STAGED_BINDINGS")"
+if [ "$patched_decodes" != "$EXPECTED_STRING_DECODES" ] || grep -q 'String(bytes:' "$STAGED_BINDINGS"; then
+    echo "error: expected to patch $EXPECTED_STRING_DECODES \`String(bytes: …, encoding: String.Encoding.utf8)!\` in $STAGED_BINDINGS, patched ${patched_decodes:-0}."
+    echo "  remaining String(bytes:) calls:"
+    grep -n 'String(bytes:' "$STAGED_BINDINGS" || echo "  (none)"
+    echo "  The generated string decoding changed (cargo-swift/uniffi bump?): update the pattern or"
+    echo "  EXPECTED_STRING_DECODES in scripts/build-local.sh so a leading U+FEFF stays preserved."
+    exit 1
+fi
 
 echo "==> Staging XCFramework at SudachiSwift.xcframework/"
 rm -rf SudachiSwift.xcframework

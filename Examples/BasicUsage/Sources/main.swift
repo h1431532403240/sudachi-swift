@@ -46,6 +46,9 @@ do {
     }
 
     print("\n=== Done ===")
+} catch let error as SudachiError {
+    print("Error: \(error.message)")
+    exit(1)
 } catch {
     print("Error: \(error)")
     exit(1)

@@ -15,9 +15,12 @@ extension MorphemeInfo: CustomStringConvertible {
     }
 }
 
-extension MorphemeInfo: Identifiable {
-    public var id: String { "\(begin)-\(end)-\(surface)" }
-}
+// MorphemeInfo deliberately doesn't conform to Identifiable (it did until
+// 0.6.x, with id "\(begin)-\(end)-\(surface)"): no id derived from its
+// values is unique. Normalization can expand one character (e.g. "…") into
+// several morphemes with empty surfaces at the same offset, and lookup()
+// returns homographs with the same surface and offsets. In SwiftUI, use
+// `ForEach(Array(morphemes.enumerated()), id: \.offset)`.
 
 extension TokenizeMode: CustomStringConvertible {
     public var description: String {
@@ -25,6 +28,21 @@ extension TokenizeMode: CustomStringConvertible {
         case .a: return "Short (A)"
         case .b: return "Middle (B)"
         case .c: return "Long (C)"
+        }
+    }
+}
+
+extension SudachiError {
+    /// The error's message without the case name, for showing to users
+    /// (`localizedDescription` is UniFFI's debug description, e.g.
+    /// `SudachiSwift.SudachiError.DictionaryLoadError(message: "…")`).
+    public var message: String {
+        switch self {
+        case .DictionaryLoadError(let message),
+             .ConfigError(let message),
+             .TokenizeError(let message),
+             .InvalidArgument(let message):
+            return message
         }
     }
 }
@@ -93,7 +111,29 @@ extension Tokenizer {
     /// the resulting `.dic` at ``SudachiDictionaryStore/dictionaryPath(for:in:)``.
     /// This package does not bundle a zip extractor — `FileManager.unzipItem`
     /// doesn't exist on iOS, so leaving the choice to the caller keeps the
-    /// dependency surface clean.
+    /// dependency surface clean. On iOS, exclude the file from backup
+    /// (`URLResourceValues.isExcludedFromBackup`): it is large and can be
+    /// downloaded again.
+    ///
+    /// ## Trusted input
+    ///
+    /// Load dictionaries only from sources you trust: a malformed or tampered
+    /// `.dic` can crash the process instead of throwing. The file is
+    /// memory-mapped while the tokenizer uses it, so replace it by moving a
+    /// new file into place (`FileManager.moveItem(at:to:)` /
+    /// `replaceItemAt(_:withItemAt:backupItemName:options:)`), never by
+    /// overwriting it in place.
+    ///
+    /// ## Errors
+    ///
+    /// Throws ``SudachiError``; show ``SudachiError/message`` to users. An
+    /// internal failure (a Rust panic) is thrown as a different `Error` type,
+    /// so keep a generic `catch` as well.
+    ///
+    /// Create the tokenizer once and reuse it (loading takes tens of
+    /// milliseconds or more; it can be shared across threads). For the input
+    /// size limit of ``Tokenizer/tokenize(text:mode:)``, split long text with
+    /// the free function `splitSentences(text:)` first.
     ///
     /// - Parameters:
     ///   - dictionaryPath: Absolute path to a system `.dic` file.
@@ -194,8 +234,18 @@ public enum SudachiDictDistribution: String, CaseIterable, CustomStringConvertib
 /// let tokenizer = try SudachiDictionaryStore.createTokenizer()
 /// ```
 public enum SudachiDictionaryStore {
-    /// Conventional install root: `~/Library/Application Support/SudachiSwift/`
-    /// on macOS, the equivalent sandboxed location on iOS.
+    /// Conventional install root: `Application Support/SudachiSwift/` in the
+    /// app's container.
+    ///
+    /// On iOS, Application Support is included in iCloud and device backups:
+    /// set `URLResourceValues.isExcludedFromBackup` on a downloaded `.dic`
+    /// (it is 115–331 MB and can be downloaded again).
+    ///
+    /// On macOS, every non-sandboxed app or command-line tool shares
+    /// `~/Library/Application Support/SudachiSwift/` (there is no per-app
+    /// subfolder), so a file there can belong to another app, possibly one
+    /// on an older SudachiSwift that needs a different dictionary format.
+    /// Pass your own directory to the `in:` parameters if that matters.
     public static let defaultDirectory: URL = {
         let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
@@ -218,15 +268,19 @@ public enum SudachiDictionaryStore {
 
     /// `true` if a `.dic` whose header says format V1 exists at
     /// ``dictionaryPath(for:in:)``. Only the header is checked: an
-    /// interrupted download still reports `true`, so verify the size or
-    /// checksum of a download before moving it into place.
+    /// interrupted download still reports `true`, so check a download before
+    /// moving it into place (HTTP status 200 and the expected size, or a
+    /// SHA-256 you recorded yourself when you pinned a version: the CDN
+    /// publishes no checksums).
     ///
     /// A V0 dictionary left over from SudachiSwift 0.6 reports `false`, so a
     /// "download if not installed" flow downloads again — but the old file
     /// is still in place. Delete it before moving the new one in
     /// (`FileManager.moveItem(at:to:)` fails when the destination exists), or
     /// use `FileManager.replaceItemAt(_:withItemAt:backupItemName:options:)`,
-    /// and create the directory first if it doesn't exist yet.
+    /// and create the directory first if it doesn't exist yet. Never write
+    /// into the installed file in place: a ``Tokenizer`` that has it open
+    /// memory-maps it, and changing the file under it can crash the process.
     public static func isInstalled(
         _ distribution: SudachiDictDistribution,
         in directory: URL = defaultDirectory
@@ -277,13 +331,18 @@ public enum SudachiDictionaryStore {
     /// first V1 dictionary in its search order, or, if there is none, the
     /// first matching file in another format.
     ///
+    /// - Parameter additionalPaths: Directories to search before
+    ///   ``defaultDirectory`` and the main bundle, e.g. the directory you
+    ///   passed to ``dictionaryPath(for:in:)`` or an App Group container.
+    ///
     /// Throws ``SudachiError/DictionaryLoadError(message:)`` with an
-    /// actionable hint when no dictionary is installed, or when no V1 file
+    /// actionable hint when no dictionary is found, or when no V1 file
     /// was found and the fallback is a legacy V0 dictionary.
-    public static func createTokenizer() throws -> Tokenizer {
-        guard let path = findDictionary() else {
+    public static func createTokenizer(in additionalPaths: [URL] = []) throws -> Tokenizer {
+        guard let path = findDictionary(in: additionalPaths) else {
+            let directories = (additionalPaths + [defaultDirectory]).map(\.path)
             throw SudachiError.DictionaryLoadError(
-                message: "No .dic file found. Place a V1 dictionary (see SudachiDictDistribution.downloadURL()) at \(defaultDirectory.path) or bundle it with your app."
+                message: "No .dic file found. Place a V1 dictionary (see SudachiDictDistribution.downloadURL()) in \(directories.joined(separator: " or ")) or bundle it with your app."
             )
         }
         return try Tokenizer.create(dictionaryPath: path.path)

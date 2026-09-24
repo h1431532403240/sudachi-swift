@@ -487,7 +487,7 @@ fileprivate struct FfiConverterString: FfiConverter {
             return String()
         }
         let bytes = UnsafeBufferPointer<UInt8>(start: value.data!, count: Int(value.len))
-        return String(bytes: bytes, encoding: String.Encoding.utf8)!
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func lower(_ value: String) -> RustBuffer {
@@ -503,7 +503,7 @@ fileprivate struct FfiConverterString: FfiConverter {
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> String {
         let len: Int32 = try readInt(&buf)
-        return String(bytes: try readBytes(&buf, count: Int(len)), encoding: String.Encoding.utf8)!
+        return String(decoding: try readBytes(&buf, count: Int(len)), as: UTF8.self)
     }
 
     public static func write(_ value: String, into buf: inout [UInt8]) {
@@ -516,6 +516,13 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 
 
+/**
+ * A loaded system dictionary (plus user dictionaries) and the analyzer.
+ *
+ * Loading a dictionary takes tens of milliseconds or more, so create one
+ * Tokenizer and reuse it; it can be shared across threads. Dictionaries and
+ * config files are trusted input (see `TokenizerConfig`).
+ */
 public protocol TokenizerProtocol: AnyObject, Sendable {
     
     /**
@@ -525,6 +532,10 @@ public protocol TokenizerProtocol: AnyObject, Sendable {
      * Since sudachi.rs 0.7 the query is first normalized by the dictionary's
      * input-text plugins (e.g. full-width → half-width), so the returned
      * `surface` and offsets refer to the normalized query, not `query`.
+     * Several entries can share the same surface and offsets (homographs).
+     *
+     * Throws `TokenizeError` for input over the limit described on
+     * `tokenize`.
      */
     func lookup(query: String) throws  -> [MorphemeInfo]
     
@@ -541,11 +552,24 @@ public protocol TokenizerProtocol: AnyObject, Sendable {
      * Caveat: with sudachi.rs 0.6.11–0.7.0, a boundary right after a lexicon
      * entry such as `。` is not split when more text follows (upstream
      * `sentence_detector` bug), so real dictionaries often return the whole
-     * text as one range. Use the free function `split_sentences`
-     * (`splitSentences(text:)` in Swift) for rule-based splitting.
+     * text as one range. Since sudachi.rs 0.7.0 it also stops splitting
+     * after the first ASCII `"`. Use the free function `splitSentences(text:)`, which works around the
+     * ASCII `"` issue, for rule-based splitting.
      */
     func splitSentences(text: String)  -> [SentenceRange]
     
+    /**
+     * Split `text` into morphemes using `mode`.
+     *
+     * Input limit: throws `TokenizeError` when `text` is longer than 49,149
+     * UTF-8 bytes (about 16,000 Japanese characters), or when input
+     * normalization expands it past 65,535 bytes (e.g. `㍿` → `株式会社`).
+     * Split long text with the free function `splitSentences(text:)` and
+     * tokenize each range; a range
+     * can itself be longer when the text has no sentence-ending punctuation,
+     * so cut such a range further (e.g. at line breaks). The same limit
+     * applies to `tokenizeWithSubunits` and `lookup`.
+     */
     func tokenize(text: String, mode: TokenizeMode) throws  -> [MorphemeInfo]
     
     /**
@@ -555,10 +579,20 @@ public protocol TokenizerProtocol: AnyObject, Sendable {
      * Python binding: when `add_single` is true, morphemes that cannot
      * split further get a single-element `subunits` containing themselves;
      * when false, those entries get an empty `subunits` vector.
+     *
+     * Throws `TokenizeError` for input over the limit described on
+     * `tokenize`.
      */
     func tokenizeWithSubunits(text: String, mode: TokenizeMode, subMode: TokenizeMode, addSingle: Bool) throws  -> [MorphemeWithSubunits]
     
 }
+/**
+ * A loaded system dictionary (plus user dictionaries) and the analyzer.
+ *
+ * Loading a dictionary takes tens of milliseconds or more, so create one
+ * Tokenizer and reuse it; it can be shared across threads. Dictionaries and
+ * config files are trusted input (see `TokenizerConfig`).
+ */
 open class Tokenizer: TokenizerProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
 
@@ -598,6 +632,14 @@ open class Tokenizer: TokenizerProtocol, @unchecked Sendable {
     public func uniffiCloneHandle() -> UInt64 {
         return try! rustCall { uniffi_sudachi_swift_fn_clone_tokenizer(self.handle, $0) }
     }
+    /**
+     * Load the dictionaries described by `config`.
+     *
+     * Throws `InvalidArgument` when `dictionaryPath` is empty,
+     * `ConfigError` when the config file can't be read or parsed, and
+     * `DictionaryLoadError` when a dictionary or resource can't be loaded
+     * (including legacy V0 dictionaries).
+     */
 public convenience init(config: TokenizerConfig)throws  {
     let handle =
         try rustCallWithError(FfiConverterTypeSudachiError_lift) {
@@ -618,6 +660,10 @@ public convenience init(config: TokenizerConfig)throws  {
     }
 
     
+    /**
+     * Load the system dictionary at `dictionaryPath` with the config and
+     * resources embedded in sudachi.rs. Throws like `init(config:)`.
+     */
 public static func withDictionary(dictionaryPath: String)throws  -> Tokenizer  {
     return try  FfiConverterTypeTokenizer_lift(try rustCallWithError(FfiConverterTypeSudachiError_lift) {
     uniffi_sudachi_swift_fn_constructor_tokenizer_with_dictionary(
@@ -635,6 +681,10 @@ public static func withDictionary(dictionaryPath: String)throws  -> Tokenizer  {
      * Since sudachi.rs 0.7 the query is first normalized by the dictionary's
      * input-text plugins (e.g. full-width → half-width), so the returned
      * `surface` and offsets refer to the normalized query, not `query`.
+     * Several entries can share the same surface and offsets (homographs).
+     *
+     * Throws `TokenizeError` for input over the limit described on
+     * `tokenize`.
      */
 open func lookup(query: String)throws  -> [MorphemeInfo]  {
     return try  FfiConverterSequenceTypeMorphemeInfo.lift(try rustCallWithError(FfiConverterTypeSudachiError_lift) {
@@ -665,8 +715,9 @@ open func posOf(posId: UInt32) -> [String]?  {
      * Caveat: with sudachi.rs 0.6.11–0.7.0, a boundary right after a lexicon
      * entry such as `。` is not split when more text follows (upstream
      * `sentence_detector` bug), so real dictionaries often return the whole
-     * text as one range. Use the free function `split_sentences`
-     * (`splitSentences(text:)` in Swift) for rule-based splitting.
+     * text as one range. Since sudachi.rs 0.7.0 it also stops splitting
+     * after the first ASCII `"`. Use the free function `splitSentences(text:)`, which works around the
+     * ASCII `"` issue, for rule-based splitting.
      */
 open func splitSentences(text: String) -> [SentenceRange]  {
     return try!  FfiConverterSequenceTypeSentenceRange.lift(try! rustCall() {
@@ -677,6 +728,18 @@ open func splitSentences(text: String) -> [SentenceRange]  {
 })
 }
     
+    /**
+     * Split `text` into morphemes using `mode`.
+     *
+     * Input limit: throws `TokenizeError` when `text` is longer than 49,149
+     * UTF-8 bytes (about 16,000 Japanese characters), or when input
+     * normalization expands it past 65,535 bytes (e.g. `㍿` → `株式会社`).
+     * Split long text with the free function `splitSentences(text:)` and
+     * tokenize each range; a range
+     * can itself be longer when the text has no sentence-ending punctuation,
+     * so cut such a range further (e.g. at line breaks). The same limit
+     * applies to `tokenizeWithSubunits` and `lookup`.
+     */
 open func tokenize(text: String, mode: TokenizeMode)throws  -> [MorphemeInfo]  {
     return try  FfiConverterSequenceTypeMorphemeInfo.lift(try rustCallWithError(FfiConverterTypeSudachiError_lift) {
     uniffi_sudachi_swift_fn_method_tokenizer_tokenize(
@@ -694,6 +757,9 @@ open func tokenize(text: String, mode: TokenizeMode)throws  -> [MorphemeInfo]  {
      * Python binding: when `add_single` is true, morphemes that cannot
      * split further get a single-element `subunits` containing themselves;
      * when false, those entries get an empty `subunits` vector.
+     *
+     * Throws `TokenizeError` for input over the limit described on
+     * `tokenize`.
      */
 open func tokenizeWithSubunits(text: String, mode: TokenizeMode, subMode: TokenizeMode, addSingle: Bool)throws  -> [MorphemeWithSubunits]  {
     return try  FfiConverterSequenceTypeMorphemeWithSubunits.lift(try rustCallWithError(FfiConverterTypeSudachiError_lift) {
@@ -804,7 +870,7 @@ public struct MorphemeInfo: Equatable, Hashable {
     public var partOfSpeechId: UInt32
     /**
      * Dictionary ID: 0 = system; 1+ = user dictionaries, numbered with the
-     * config file's `userDict` entries first, then `user_dictionary_paths`;
+     * config file's `userDict` entries first, then `userDictionaryPaths`;
      * -1 = OOV.
      */
     public var dictionaryId: Int32
@@ -864,7 +930,7 @@ public struct MorphemeInfo: Equatable, Hashable {
          */partOfSpeechId: UInt32, 
         /**
          * Dictionary ID: 0 = system; 1+ = user dictionaries, numbered with the
-         * config file's `userDict` entries first, then `user_dictionary_paths`;
+         * config file's `userDict` entries first, then `userDictionaryPaths`;
          * -1 = OOV.
          */dictionaryId: Int32, 
         /**
@@ -1120,17 +1186,30 @@ public func FfiConverterTypeSentenceRange_lower(_ value: SentenceRange) -> RustB
 
 /**
  * Configuration for creating a Tokenizer
+ *
+ * Dictionaries and the config file are trusted input: load them only from
+ * sources you control. A malformed or tampered `.dic` can crash the process
+ * instead of throwing, and a plugin `class` in the config that isn't one of
+ * the built-in `com.worksap.nlp.sudachi.*` names is loaded as a native
+ * library, so its code runs in your process.
  */
 public struct TokenizerConfig: Equatable, Hashable {
     /**
      * Path to the system dictionary file (.dic), in binary format V1. A
-     * relative path resolves like resources (see `resource_path`, then the
-     * current directory); prefer absolute paths.
+     * relative path resolves like resources (see `resourcePath`, then the
+     * current directory); prefer absolute paths. An empty path throws
+     * `InvalidArgument`.
+     *
+     * Dictionaries are memory-mapped while a Tokenizer uses them: to update
+     * one, move a new file into place (rename), never overwrite or truncate
+     * the file in place, which can crash the process.
      */
     public var dictionaryPath: String
     /**
      * Optional path to sudachi.json config file. When omitted, the default
-     * config embedded in sudachi.rs is used.
+     * config embedded in sudachi.rs is used. Use only a config you control
+     * (see the note on trusted input above). A load error message starts
+     * with this path.
      */
     public var configPath: String?
     /**
@@ -1145,7 +1224,7 @@ public struct TokenizerConfig: Equatable, Hashable {
     /**
      * User dictionary files, applied in order and appended after the config
      * file's `userDict` entries. Relative paths resolve like resources
-     * (`resource_path`, the config's `path` field, the config file's
+     * (`resourcePath`, the config's `path` field, the config file's
      * directory, then the current directory), not against the system `.dic`'s
      * directory, so prefer absolute paths.
      */
@@ -1156,12 +1235,19 @@ public struct TokenizerConfig: Equatable, Hashable {
     public init(
         /**
          * Path to the system dictionary file (.dic), in binary format V1. A
-         * relative path resolves like resources (see `resource_path`, then the
-         * current directory); prefer absolute paths.
+         * relative path resolves like resources (see `resourcePath`, then the
+         * current directory); prefer absolute paths. An empty path throws
+         * `InvalidArgument`.
+         *
+         * Dictionaries are memory-mapped while a Tokenizer uses them: to update
+         * one, move a new file into place (rename), never overwrite or truncate
+         * the file in place, which can crash the process.
          */dictionaryPath: String, 
         /**
          * Optional path to sudachi.json config file. When omitted, the default
-         * config embedded in sudachi.rs is used.
+         * config embedded in sudachi.rs is used. Use only a config you control
+         * (see the note on trusted input above). A load error message starts
+         * with this path.
          */configPath: String?, 
         /**
          * Optional resource directory (where char.def, unk.def, rewrite.def are
@@ -1174,7 +1260,7 @@ public struct TokenizerConfig: Equatable, Hashable {
         /**
          * User dictionary files, applied in order and appended after the config
          * file's `userDict` entries. Relative paths resolve like resources
-         * (`resource_path`, the config's `path` field, the config file's
+         * (`resourcePath`, the config's `path` field, the config file's
          * directory, then the current directory), not against the system `.dic`'s
          * directory, so prefer absolute paths.
          */userDictionaryPaths: [String]) {
@@ -1320,16 +1406,41 @@ public func FfiConverterTypeDictionaryFormat_lower(_ value: DictionaryFormat) ->
 
 
 
+/**
+ * Errors thrown by this library.
+ *
+ * In Swift, `message` gives the bare message for display
+ * (`localizedDescription` is UniFFI's debug description of the case).
+ *
+ * An internal failure (a Rust panic, which should not happen) is thrown as
+ * a different `Error` type, not as `SudachiError`, so keep a generic
+ * `catch` after `catch let error as SudachiError`.
+ */
 public enum SudachiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
+    /**
+     * A dictionary or resource file could not be loaded (missing, legacy
+     * V0, or built against another system dictionary).
+     */
     case DictionaryLoadError(message: String
     )
+    /**
+     * The config file could not be read or parsed. The message starts with
+     * the config file's path.
+     */
     case ConfigError(message: String
     )
+    /**
+     * Analysis failed, e.g. because the input is too long (see
+     * `Tokenizer.tokenize`).
+     */
     case TokenizeError(message: String
     )
+    /**
+     * An argument is invalid, e.g. an empty `dictionaryPath`.
+     */
     case InvalidArgument(message: String
     )
 
@@ -1703,8 +1814,19 @@ public func getVersion() -> String  {
 })
 }
 /**
- * Rule-based sentence splitter (no lexicon). For lexicon-aware splitting
- * use `Tokenizer.split_sentences` instead.
+ * Rule-based sentence splitter (no lexicon, no dictionary needed). For
+ * lexicon-aware splitting see `Tokenizer.splitSentences(text:)`, which has known
+ * upstream issues.
+ *
+ * Works around a sudachi.rs 0.7.0 regression where no sentence was split
+ * after the first ASCII `"`: the splitter runs on a copy of `text` with
+ * every ASCII `"` replaced by `'` (same byte offsets), and each range's
+ * `text` is sliced from the original `text`. Results match sudachi.rs
+ * 0.6.11 and Sudachi (Java) 0.8.2.
+ *
+ * Useful for chunking long text before `Tokenizer.tokenize` (see its input
+ * limit). When no sentence ends within the first 4,096 characters, the
+ * rest of the text comes back as one range, which can exceed that limit.
  */
 public func splitSentences(text: String) -> [SentenceRange]  {
     return try!  FfiConverterSequenceTypeSentenceRange.lift(try! rustCall() {
@@ -1735,28 +1857,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sudachi_swift_checksum_func_get_version() != 831) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sudachi_swift_checksum_func_split_sentences() != 34300) {
+    if (uniffi_sudachi_swift_checksum_func_split_sentences() != 33649) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sudachi_swift_checksum_method_tokenizer_lookup() != 59661) {
+    if (uniffi_sudachi_swift_checksum_method_tokenizer_lookup() != 31835) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sudachi_swift_checksum_method_tokenizer_pos_of() != 13682) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sudachi_swift_checksum_method_tokenizer_split_sentences() != 33349) {
+    if (uniffi_sudachi_swift_checksum_method_tokenizer_split_sentences() != 51130) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sudachi_swift_checksum_method_tokenizer_tokenize() != 14556) {
+    if (uniffi_sudachi_swift_checksum_method_tokenizer_tokenize() != 8470) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sudachi_swift_checksum_method_tokenizer_tokenize_with_subunits() != 62037) {
+    if (uniffi_sudachi_swift_checksum_method_tokenizer_tokenize_with_subunits() != 52930) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sudachi_swift_checksum_constructor_tokenizer_new() != 45939) {
+    if (uniffi_sudachi_swift_checksum_constructor_tokenizer_new() != 43786) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sudachi_swift_checksum_constructor_tokenizer_with_dictionary() != 25173) {
+    if (uniffi_sudachi_swift_checksum_constructor_tokenizer_with_dictionary() != 16937) {
         return InitializationResult.apiChecksumMismatch
     }
 

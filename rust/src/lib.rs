@@ -2,6 +2,7 @@
 //!
 //! This crate provides UniFFI bindings to expose sudachi.rs functionality to Swift.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -22,17 +23,32 @@ uniffi::setup_scaffolding!();
 
 // ============ Error Handling ============
 
+/// Errors thrown by this library.
+///
+/// In Swift, `message` gives the bare message for display
+/// (`localizedDescription` is UniFFI's debug description of the case).
+///
+/// An internal failure (a Rust panic, which should not happen) is thrown as
+/// a different `Error` type, not as `SudachiError`, so keep a generic
+/// `catch` after `catch let error as SudachiError`.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SudachiError {
+    /// A dictionary or resource file could not be loaded (missing, legacy
+    /// V0, or built against another system dictionary).
     #[error("Failed to load dictionary: {message}")]
     DictionaryLoadError { message: String },
 
+    /// The config file could not be read or parsed. The message starts with
+    /// the config file's path.
     #[error("Failed to load config: {message}")]
     ConfigError { message: String },
 
+    /// Analysis failed, e.g. because the input is too long (see
+    /// `Tokenizer.tokenize`).
     #[error("Tokenization failed: {message}")]
     TokenizeError { message: String },
 
+    /// An argument is invalid, e.g. an empty `dictionaryPath`.
     #[error("Invalid argument: {message}")]
     InvalidArgument { message: String },
 }
@@ -89,7 +105,7 @@ pub struct MorphemeInfo {
     /// Part-of-speech numeric ID
     pub part_of_speech_id: u32,
     /// Dictionary ID: 0 = system; 1+ = user dictionaries, numbered with the
-    /// config file's `userDict` entries first, then `user_dictionary_paths`;
+    /// config file's `userDict` entries first, then `userDictionaryPaths`;
     /// -1 = OOV.
     pub dictionary_id: i32,
     /// Synonym group IDs this morpheme belongs to
@@ -128,14 +144,27 @@ pub struct SentenceRange {
 // ============ Tokenizer Configuration ============
 
 /// Configuration for creating a Tokenizer
+///
+/// Dictionaries and the config file are trusted input: load them only from
+/// sources you control. A malformed or tampered `.dic` can crash the process
+/// instead of throwing, and a plugin `class` in the config that isn't one of
+/// the built-in `com.worksap.nlp.sudachi.*` names is loaded as a native
+/// library, so its code runs in your process.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TokenizerConfig {
     /// Path to the system dictionary file (.dic), in binary format V1. A
-    /// relative path resolves like resources (see `resource_path`, then the
-    /// current directory); prefer absolute paths.
+    /// relative path resolves like resources (see `resourcePath`, then the
+    /// current directory); prefer absolute paths. An empty path throws
+    /// `InvalidArgument`.
+    ///
+    /// Dictionaries are memory-mapped while a Tokenizer uses them: to update
+    /// one, move a new file into place (rename), never overwrite or truncate
+    /// the file in place, which can crash the process.
     pub dictionary_path: String,
     /// Optional path to sudachi.json config file. When omitted, the default
-    /// config embedded in sudachi.rs is used.
+    /// config embedded in sudachi.rs is used. Use only a config you control
+    /// (see the note on trusted input above). A load error message starts
+    /// with this path.
     pub config_path: Option<String>,
     /// Optional resource directory (where char.def, unk.def, rewrite.def are
     /// located). Resources are resolved in sudachi.rs order: this directory,
@@ -146,7 +175,7 @@ pub struct TokenizerConfig {
     pub resource_path: Option<String>,
     /// User dictionary files, applied in order and appended after the config
     /// file's `userDict` entries. Relative paths resolve like resources
-    /// (`resource_path`, the config's `path` field, the config file's
+    /// (`resourcePath`, the config's `path` field, the config file's
     /// directory, then the current directory), not against the system `.dic`'s
     /// directory, so prefer absolute paths.
     pub user_dictionary_paths: Vec<String>,
@@ -177,6 +206,11 @@ fn morpheme_to_info<T: DictionaryAccess>(m: &Morpheme<T>) -> MorphemeInfo {
 
 // ============ Main Tokenizer Object ============
 
+/// A loaded system dictionary (plus user dictionaries) and the analyzer.
+///
+/// Loading a dictionary takes tens of milliseconds or more, so create one
+/// Tokenizer and reuse it; it can be shared across threads. Dictionaries and
+/// config files are trusted input (see `TokenizerConfig`).
 #[derive(uniffi::Object)]
 pub struct Tokenizer {
     dictionary: Arc<JapaneseDictionary>,
@@ -184,17 +218,34 @@ pub struct Tokenizer {
 
 #[uniffi::export]
 impl Tokenizer {
+    /// Load the dictionaries described by `config`.
+    ///
+    /// Throws `InvalidArgument` when `dictionaryPath` is empty,
+    /// `ConfigError` when the config file can't be read or parsed, and
+    /// `DictionaryLoadError` when a dictionary or resource can't be loaded
+    /// (including legacy V0 dictionaries).
     #[uniffi::constructor]
     pub fn new(config: TokenizerConfig) -> Result<Arc<Self>, SudachiError> {
+        if config.dictionary_path.is_empty() {
+            // Upstream would resolve "" to the first resource directory and
+            // fail with an unrelated "Invalid argument (os error 22)".
+            return Err(SudachiError::InvalidArgument {
+                message: "dictionaryPath is empty; pass the path of a V1 system .dic file".into(),
+            });
+        }
         // Same construction as the sudachi.rs CLI (`Config::new`), so
-        // resource and dictionary path resolution follows upstream.
+        // resource and dictionary path resolution follows upstream. It only
+        // fails while loading the config file.
         let mut cfg = Config::new(
             config.config_path.as_ref().map(PathBuf::from),
             config.resource_path.as_ref().map(PathBuf::from),
             Some(PathBuf::from(&config.dictionary_path)),
         )
         .map_err(|e| SudachiError::ConfigError {
-            message: e.to_string(),
+            message: match &config.config_path {
+                Some(path) => format!("{path}: {e}"),
+                None => e.to_string(),
+            },
         })?;
         cfg.user_dicts
             .extend(config.user_dictionary_paths.iter().map(PathBuf::from));
@@ -213,6 +264,8 @@ impl Tokenizer {
         }))
     }
 
+    /// Load the system dictionary at `dictionaryPath` with the config and
+    /// resources embedded in sudachi.rs. Throws like `init(config:)`.
     #[uniffi::constructor]
     pub fn with_dictionary(dictionary_path: String) -> Result<Arc<Self>, SudachiError> {
         Self::new(TokenizerConfig {
@@ -223,6 +276,16 @@ impl Tokenizer {
         })
     }
 
+    /// Split `text` into morphemes using `mode`.
+    ///
+    /// Input limit: throws `TokenizeError` when `text` is longer than 49,149
+    /// UTF-8 bytes (about 16,000 Japanese characters), or when input
+    /// normalization expands it past 65,535 bytes (e.g. `㍿` → `株式会社`).
+    /// Split long text with the free function `splitSentences(text:)` and
+    /// tokenize each range; a range
+    /// can itself be longer when the text has no sentence-ending punctuation,
+    /// so cut such a range further (e.g. at line breaks). The same limit
+    /// applies to `tokenizeWithSubunits` and `lookup`.
     pub fn tokenize(
         &self,
         text: String,
@@ -241,6 +304,9 @@ impl Tokenizer {
     /// Python binding: when `add_single` is true, morphemes that cannot
     /// split further get a single-element `subunits` containing themselves;
     /// when false, those entries get an empty `subunits` vector.
+    ///
+    /// Throws `TokenizeError` for input over the limit described on
+    /// `tokenize`.
     pub fn tokenize_with_subunits(
         &self,
         text: String,
@@ -287,6 +353,10 @@ impl Tokenizer {
     /// Since sudachi.rs 0.7 the query is first normalized by the dictionary's
     /// input-text plugins (e.g. full-width → half-width), so the returned
     /// `surface` and offsets refer to the normalized query, not `query`.
+    /// Several entries can share the same surface and offsets (homographs).
+    ///
+    /// Throws `TokenizeError` for input over the limit described on
+    /// `tokenize`.
     pub fn lookup(&self, query: String) -> Result<Vec<MorphemeInfo>, SudachiError> {
         let mut list: MorphemeList<Arc<JapaneseDictionary>> =
             MorphemeList::empty(self.dictionary.clone());
@@ -313,11 +383,13 @@ impl Tokenizer {
     /// Caveat: with sudachi.rs 0.6.11–0.7.0, a boundary right after a lexicon
     /// entry such as `。` is not split when more text follows (upstream
     /// `sentence_detector` bug), so real dictionaries often return the whole
-    /// text as one range. Use the free function `split_sentences`
-    /// (`splitSentences(text:)` in Swift) for rule-based splitting.
+    /// text as one range. Since sudachi.rs 0.7.0 it also stops splitting
+    /// after the first ASCII `"`. Use the free function `splitSentences(text:)`, which works around the
+    /// ASCII `"` issue, for rule-based splitting.
     pub fn split_sentences(&self, text: String) -> Vec<SentenceRange> {
         collect_sentences(
             SentenceSplitter::new().with_checker(self.dictionary.lexicon()),
+            &text,
             &text,
         )
     }
@@ -344,15 +416,40 @@ impl Tokenizer {
     }
 }
 
-fn collect_sentences<S: SplitSentences>(splitter: S, text: &str) -> Vec<SentenceRange> {
+/// Split `analyzed` with `splitter`, taking each range's text from
+/// `original`, which must have the same byte length and char boundaries as
+/// `analyzed` (see `mask_ascii_double_quotes`).
+fn collect_sentences<S: SplitSentences>(
+    splitter: S,
+    analyzed: &str,
+    original: &str,
+) -> Vec<SentenceRange> {
+    debug_assert_eq!(analyzed.len(), original.len());
     splitter
-        .split(text)
-        .map(|(range, slice)| SentenceRange {
+        .split(analyzed)
+        .map(|(range, _)| SentenceRange {
             begin: range.start as u32,
             end: range.end as u32,
-            text: slice.to_string(),
+            text: original[range].to_string(),
         })
         .collect()
+}
+
+/// Replace every ASCII `"` with `'`, which the sentence detector doesn't
+/// treat specially. Both are one byte, so byte offsets and char boundaries
+/// are unchanged.
+///
+/// sudachi.rs 0.7.0 (upstream PR #340) added `"` to both its opening and
+/// closing bracket sets, and the opening check wins, so after the first
+/// ASCII `"` no sentence boundary is found. sudachi.rs 0.6.11 and Sudachi
+/// (Java) 0.8.2 treat `"` as an ordinary character, as the masked text
+/// makes 0.7.0 do.
+fn mask_ascii_double_quotes(text: &str) -> Cow<'_, str> {
+    if text.contains('"') {
+        Cow::Owned(text.replace('"', "'"))
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 // ============ Free Functions ============
@@ -363,11 +460,26 @@ pub fn get_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// Rule-based sentence splitter (no lexicon). For lexicon-aware splitting
-/// use `Tokenizer.split_sentences` instead.
+/// Rule-based sentence splitter (no lexicon, no dictionary needed). For
+/// lexicon-aware splitting see `Tokenizer.splitSentences(text:)`, which has known
+/// upstream issues.
+///
+/// Works around a sudachi.rs 0.7.0 regression where no sentence was split
+/// after the first ASCII `"`: the splitter runs on a copy of `text` with
+/// every ASCII `"` replaced by `'` (same byte offsets), and each range's
+/// `text` is sliced from the original `text`. Results match sudachi.rs
+/// 0.6.11 and Sudachi (Java) 0.8.2.
+///
+/// Useful for chunking long text before `Tokenizer.tokenize` (see its input
+/// limit). When no sentence ends within the first 4,096 characters, the
+/// rest of the text comes back as one range, which can exceed that limit.
 #[uniffi::export]
 pub fn split_sentences(text: String) -> Vec<SentenceRange> {
-    collect_sentences(SentenceSplitter::new(), &text)
+    collect_sentences(
+        SentenceSplitter::new(),
+        &mask_ascii_double_quotes(&text),
+        &text,
+    )
 }
 
 // ============ Dictionary Format ============
@@ -432,7 +544,7 @@ fn detect_dictionary_format(path: &Path) -> DictionaryFormat {
 /// dictionary can surface as an unrelated char.def error or a bare
 /// "Invalid description: V0 version".
 ///
-/// Checks the paths exactly as upstream resolves them (`resource_path`, the
+/// Checks the paths exactly as upstream resolves them (`resourcePath`, the
 /// config's `path` field, the config file's directory, then the current
 /// directory), including `userDict` entries from a custom config file. When
 /// resolution fails, the check is skipped so `from_cfg` reports the real
@@ -741,5 +853,91 @@ mod tests {
         assert_eq!(sentences[0].begin, 0);
         assert_eq!(sentences[0].end as usize, text.len());
         assert_eq!(sentences[0].text, text);
+    }
+
+    /// `(begin, end, text)` of each range, for compact assertions.
+    fn sentence_tuples(sentences: &[SentenceRange]) -> Vec<(u32, u32, &str)> {
+        sentences
+            .iter()
+            .map(|s| (s.begin, s.end, s.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn test_split_sentences_after_ascii_double_quote() {
+        // sudachi.rs 0.7.0 alone returns this as one sentence.
+        let text = "彼は\"はい\"と言った。次の文です。";
+        let first = "彼は\"はい\"と言った。";
+        let end = first.len() as u32;
+        let sentences = split_sentences(text.into());
+        assert_eq!(
+            sentence_tuples(&sentences),
+            [(0, end, first), (end, text.len() as u32, "次の文です。")]
+        );
+        // The offsets are those of the masked text the splitter saw.
+        let masked: Vec<_> = SentenceSplitter::new()
+            .split(&text.replace('"', "'"))
+            .map(|(range, _)| (range.start as u32, range.end as u32))
+            .collect();
+        let offsets: Vec<_> = sentences.iter().map(|s| (s.begin, s.end)).collect();
+        assert_eq!(offsets, masked);
+    }
+
+    #[test]
+    fn test_split_sentences_opening_ascii_double_quote_starts_a_sentence() {
+        // sudachi.rs 0.7.0 alone attaches the opening quote to the previous
+        // sentence: ["一文目です。\"", "引用\"から始まる文。三文目です。"].
+        let text = "一文目です。\"引用\"から始まる文。三文目です。";
+        let texts: Vec<String> = split_sentences(text.into())
+            .into_iter()
+            .map(|s| s.text)
+            .collect();
+        assert_eq!(
+            texts,
+            ["一文目です。", "\"引用\"から始まる文。", "三文目です。"]
+        );
+    }
+
+    #[test]
+    fn test_split_sentences_only_ascii_double_quotes() {
+        let text = "\"\"\"";
+        assert_eq!(
+            sentence_tuples(&split_sentences(text.into())),
+            [(0, 3, text)]
+        );
+    }
+
+    #[test]
+    fn test_empty_dictionary_path_is_invalid_argument() {
+        match Tokenizer::with_dictionary(String::new()) {
+            Err(SudachiError::InvalidArgument { message }) => {
+                assert!(message.contains("dictionaryPath"), "{message}")
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("an empty dictionary path must not load"),
+        }
+    }
+
+    #[test]
+    fn test_config_error_names_the_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = path_string(&dir.path().join("missing.json"));
+        let invalid = path_string(&write_file(dir.path(), "invalid.json", b"{ not json"));
+        for config_path in [missing, invalid] {
+            let config = TokenizerConfig {
+                config_path: Some(config_path.clone()),
+                ..test_dictionary_config(dir.path())
+            };
+            match Tokenizer::new(config) {
+                Err(SudachiError::ConfigError { message }) => {
+                    assert!(
+                        message.starts_with(&format!("{config_path}: ")),
+                        "{message}"
+                    )
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+                Ok(_) => panic!("{config_path} must not load"),
+            }
+        }
     }
 }
