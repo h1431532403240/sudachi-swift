@@ -28,6 +28,10 @@ Package.resolved
 **/target/
 **/*.rs.bk
 Cargo.lock
+# The wrapper crate's lockfile is tracked so tests and release builds use the
+# exact dependency versions that were reviewed (`cargo test --locked`).
+# Commit its refresh together with sudachi.rs submodule / version bumps.
+!rust/Cargo.lock
 
 # ===================
 # Generated build artifacts (regenerate via scripts/build-local.sh)
