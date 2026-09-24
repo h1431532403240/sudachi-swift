@@ -7,7 +7,7 @@ import PackageDescription
 // IMPORTANT: These values are automatically updated by the release workflow.
 // Do not modify manually unless you know what you're doing.
 let version = "0.7.0"
-let checksum = "4d419e361098cb65181adcbac82d5bdb74f67e16b9f2069e3e9b81aeea2c5b77"
+let checksum = "df2d808decac4acc45251976b74c15d90c2de37a4e92477690ded8f5c84bcd91"
 
 // Local development uses an XCFramework staged at the repo root by
 // scripts/build-local.sh; published releases download the prebuilt zip
