@@ -1,8 +1,9 @@
 # For each sudachi.rs release newer than the pinned submodule tag, once: an issue assigned to
 # the repo owner (closing it skips the release; once it exists, open or closed, the release is
 # never touched again, so manual commits on the bump branch are never overwritten) and a bump
-# PR (draft if breaking or rust/ stops compiling). Also warns before GitHub auto-disables this
-# schedule (60 idle days) and opens an issue when this workflow fails.
+# PR (draft if breaking or rust/ stops compiling). Near GitHub's 60-idle-day auto-disable it
+# re-enables itself (best effort) and opens a warning issue; it also opens an issue when this
+# workflow fails.
 # Trust split: `probe` runs third-party code (`cargo check` runs upstream and crates.io build
 # scripts) with a read-only token and no secrets. It still holds the Actions runtime token
 # (artifact upload / cache), which is why release.yml does not restore caches. `report` holds
@@ -398,8 +399,9 @@ jobs:
     permissions:
       contents: read # last commit date
       issues: write  # warning issue
+      actions: write # keepalive: re-enable this workflow
     steps:
-      - name: Warn before GitHub disables this schedule
+      - name: Keep the schedule alive; warn before GitHub disables it
         env:
           GH_TOKEN: ${{ github.token }}
           WARN_DAYS: 45
@@ -425,11 +427,22 @@ jobs:
             gh issue close "$N" --comment "$C"
           done
           if [ -z "$KEEP" ]; then exit 0; fi
+          # Keepalive: re-enable this (already enabled) workflow through the documented REST endpoint.
+          # GitHub doesn't document whether this resets the inactivity timer, so the warning below
+          # still goes out once per idle period.
+          if [ "$DRY_RUN" = true ]; then
+            echo "[dry run] would re-enable check-upstream.yml (keepalive)"
+          elif gh api -X PUT "repos/$GH_REPO/actions/workflows/check-upstream.yml/enable" > /dev/null; then
+            echo "Keepalive: re-enabled check-upstream.yml"
+          else
+            echo "::warning::Keepalive: re-enabling check-upstream.yml failed"
+          fi
           N=$(jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | .number // empty' "$RUNNER_TEMP/health.json")
           if [ -n "$N" ]; then echo "Warning issue #$N already exists."; exit 0; fi
-          printf '%s\n\n%s\n\n%s\n%s\n' "No commit has landed on \`$BRANCH\` since **$LAST_DAY** ($DAYS days ago)." \
+          printf '%s\n\n%s\n\n%s\n\n%s\n%s\n' "No commit has landed on \`$BRANCH\` since **$LAST_DAY** ($DAYS days ago)." \
             "GitHub disables scheduled workflows in public repositories after 60 days without repository activity (this workflow's own runs do not count): expected around **$OFF_DAY**. After that new sudachi.rs releases are not detected and nobody is notified." \
-            "- Keep it alive: push any commit to \`$BRANCH\`. This issue then closes itself on the next run." \
+            "From now on this workflow re-enables itself daily through the REST API as a keepalive. GitHub doesn't document whether that resets the timer: if the check is still running after $OFF_DAY, it does, and you can close this issue." \
+            "- Keep it alive for sure: push any commit to \`$BRANCH\`. This issue then closes itself on the next run." \
             "- Already disabled: Actions tab → **Check Upstream Updates** → **Enable workflow**, or \`gh workflow enable check-upstream.yml\`." \
             > "$RUNNER_TEMP/inactive.md"
           if [ "$DRY_RUN" = true ]; then
