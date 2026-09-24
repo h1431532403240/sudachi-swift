@@ -4,9 +4,9 @@ import SudachiSwift
 print("=== SudachiSwift Basic Usage ===\n")
 print("Library version: \(getVersion())")
 
-print("\nAvailable SudachiDict distributions:")
+print("\nAvailable SudachiDict distributions (V1 format):")
 for dist in SudachiDictDistribution.allCases {
-    print("  - \(dist) (~\(dist.sizeMB) MB)")
+    print("  - \(dist) (~\(dist.sizeMB) MB zip)")
     print("    URL: \(dist.downloadURL())")
 }
 
@@ -14,7 +14,14 @@ let dictionaryPath = ProcessInfo.processInfo.environment["SUDACHI_DICT_PATH"] ??
 
 guard FileManager.default.fileExists(atPath: dictionaryPath) else {
     print("\n[!] Dictionary not found at: \(dictionaryPath)")
-    print("    Download from: \(SudachiDictDistribution.small.downloadURL())")
+    print("    Download a V1 dictionary from: \(SudachiDictDistribution.small.downloadURL())")
+    print("    then set SUDACHI_DICT_PATH to the extracted \(SudachiDictDistribution.small.dicFilename)")
+    exit(1)
+}
+
+guard dictionaryFormat(path: dictionaryPath) != .legacyV0 else {
+    print("\n[!] \(dictionaryPath) is a legacy V0 dictionary, which SudachiSwift \(getVersion()) can't load.")
+    print("    Download a V1 dictionary from: \(SudachiDictDistribution.small.downloadURL())")
     exit(1)
 }
 

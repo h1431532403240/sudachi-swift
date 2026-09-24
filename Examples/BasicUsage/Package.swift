@@ -10,7 +10,7 @@ let package = Package(
         .package(path: "../..")
 
         // When using as a dependency in your own project:
-        // .package(url: "https://github.com/h1431532403240/sudachi-swift", from: "0.6.11")
+        // .package(url: "https://github.com/h1431532403240/sudachi-swift", exact: "0.7.0")
     ],
     targets: [
         .executableTarget(
