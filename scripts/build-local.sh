@@ -9,9 +9,9 @@
 # the release workflow runs the equivalent steps in CI.
 #
 # Usage:
-#   ./scripts/build-local.sh              # macOS + iOS, release profile
+#   ./scripts/build-local.sh              # macOS + iOS + Mac Catalyst, release profile
 #   PROFILE=debug ./scripts/build-local.sh
-#   NIGHTLY=1 PLATFORMS="macos ios tvos visionos" ./scripts/build-local.sh
+#   NIGHTLY=1 PLATFORMS="macos ios maccatalyst tvos visionos" ./scripts/build-local.sh
 #       Use Rust nightly with `-Z build-std` to also target tvOS / visionOS.
 
 set -euo pipefail
@@ -20,7 +20,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 PROFILE="${PROFILE:-release}"
-PLATFORMS="${PLATFORMS:-macos ios}"
+# Mac Catalyst (aarch64/x86_64-apple-ios-macabi) is a Tier 2 target, so the
+# stable toolchain builds it; tvOS / visionOS still need NIGHTLY=1.
+PLATFORMS="${PLATFORMS:-macos ios maccatalyst}"
 NIGHTLY="${NIGHTLY:-0}"
 
 # cargo-swift bundles its own uniffi_bindgen, which must match the `uniffi`
