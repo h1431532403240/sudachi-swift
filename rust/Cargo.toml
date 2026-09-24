@@ -17,14 +17,19 @@ name = "sudachi_swift"
 sudachi = { path = "../sudachi.rs/sudachi" }
 # Must match the uniffi_bindgen bundled in the cargo-swift version pinned in
 # scripts/build-local.sh (cargo-swift 0.11.1 bundles uniffi_bindgen =0.31.1).
-uniffi = "=0.31.1"
+# Default features pull cargo_metadata/camino/semver into the shipped graph
+# (only needed by uniffi's bindgen-side tooling, which cargo-swift bundles).
+uniffi = { version = "=0.31.1", default-features = false }
 thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
 
 [profile.release]
-lto = true
+# `lto = true` had no effect for a "staticlib"+"lib" crate (cargo never runs
+# LTO for it) but still embedded LLVM bitcode in every object, inflating the
+# XCFramework; the final app link is what matters for size.
+lto = false
 codegen-units = 1
 opt-level = "z"
 strip = true
