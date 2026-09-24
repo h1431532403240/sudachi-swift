@@ -13,6 +13,17 @@ on:
 permissions:
   contents: read
 
+# Every `uses:` is pinned to a full commit SHA (comment: the tag or branch it
+# was taken from).
+env:
+  # Rust toolchains, pinned so CI builds with what release.yml ships with.
+  # Keep in sync with release.yml, which explains how to bump them.
+  RUST_STABLE: "1.98.1"
+  RUST_NIGHTLY: nightly-2026-09-24
+  # Fail instead of silently installing an unpinned toolchain when something
+  # asks rustup for one that isn't installed (e.g. `cargo +stable`).
+  RUSTUP_AUTO_INSTALL: "0"
+
 jobs:
   build:
     # macos-14 is being retired (brownouts from 2026-10-05, removed 2026-11-02:
@@ -22,27 +33,25 @@ jobs:
     runs-on: macos-15
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false # nothing below uses git credentials
 
+      # The dtolnay/rust-toolchain SHA is its `stable` branch (the same one
+      # check-upstream.yml pins); `toolchain:` overrides that branch's default.
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Rust targets
-        run: |
-          rustup target add aarch64-apple-ios
-          rustup target add aarch64-apple-ios-sim
-          rustup target add x86_64-apple-ios
-          rustup target add aarch64-apple-darwin
-          rustup target add x86_64-apple-darwin
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Cache Rust dependencies
         # Runs before the cargo-swift install: rust-cache leaves out anything
         # already in ~/.cargo/bin when it starts, so this order lets the pinned
         # cargo-swift be cached, and on later runs `cargo install` finds it
         # already installed.
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: rust
 
@@ -66,9 +75,12 @@ jobs:
         run: ./scripts/build-local.sh
 
       - name: Verify root Package.swift via SPM consumer fixture
-        # Builds tests/spm-consumer/ against root Package.swift with a local
-        # binaryTarget. Catches the v0.1.0 class of bug where the package's
-        # binary surface is missing symbols an external SPM user would need.
+        # Builds and runs tests/spm-consumer/ against root Package.swift with a
+        # local binaryTarget. Building catches the v0.1.0 class of bug where
+        # the package's binary surface is missing symbols an external SPM user
+        # would need; running does the fixture's dictionary-free runtime checks
+        # (e.g. rule-based splitting after an ASCII quote, a leading U+FEFF
+        # surviving the trip back from Rust) and exits non-zero on a failure.
         run: |
           set -euo pipefail
           cp Package.swift Package.swift.bak
@@ -80,7 +92,7 @@ jobs:
               '.binaryTarget(name: \"SudachiSwiftFFI\", path: \"SudachiSwift.xcframework\")',
               p.read_text(), count=1, flags=re.DOTALL))
           "
-          ( cd tests/spm-consumer && swift build )
+          ( cd tests/spm-consumer && swift run Verify )
           mv Package.swift.bak Package.swift
 
       - name: Verify iOS Simulator build
@@ -95,13 +107,13 @@ jobs:
             -skipPackagePluginValidation
 
       - name: Upload XCFramework artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: SudachiSwift.xcframework
           path: SudachiSwift.xcframework
 
       - name: Upload staged bindings
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: SudachiSwift-bindings
           path: Sources/SudachiSwift/sudachi_swift.swift
@@ -114,36 +126,60 @@ jobs:
     continue-on-error: true
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false # nothing below uses git credentials
 
       - name: Install Rust (stable)
-        # For `cargo +stable install` below; the nightly step after this one
-        # makes nightly the default toolchain.
-        uses: dtolnay/rust-toolchain@stable
+        # For `cargo +$RUST_STABLE install` below; the nightly step after this
+        # one makes nightly the default toolchain.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
 
       - name: Install Rust (nightly)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: ${{ env.RUST_NIGHTLY }}
           components: rust-src
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
 
+      - name: Make the `nightly` toolchain name run the pinned nightly
+        # Same as release.yml: build-local.sh's NIGHTLY=1 build runs cargo with
+        # RUSTUP_TOOLCHAIN=nightly. rustup accepts a symlinked toolchain
+        # directory, so point `nightly-<host>` at the pinned one (otherwise
+        # that name is not installed and the nightly build fails).
+        run: |
+          set -euo pipefail
+          HOST=$(rustc +"$RUST_NIGHTLY" -vV | sed -n 's/^host: //p')
+          TOOLCHAINS="$(rustup show home)/toolchains"
+          test -d "$TOOLCHAINS/$RUST_NIGHTLY-$HOST"
+          rm -rf "$TOOLCHAINS/nightly-$HOST"
+          ln -s "$RUST_NIGHTLY-$HOST" "$TOOLCHAINS/nightly-$HOST"
+          PINNED_HASH=$(rustc +"$RUST_NIGHTLY" -vV | sed -n 's/^commit-hash: //p')
+          ALIAS_HASH=$(RUSTUP_TOOLCHAIN=nightly rustc -vV | sed -n 's/^commit-hash: //p')
+          if [ -z "$PINNED_HASH" ] || [ "$ALIAS_HASH" != "$PINNED_HASH" ]; then
+            echo "::error::RUSTUP_TOOLCHAIN=nightly does not run $RUST_NIGHTLY"
+            exit 1
+          fi
+          RUSTUP_TOOLCHAIN=nightly rustc -V
+
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: rust
 
       - name: Install cargo-swift (version pinned in scripts/build-local.sh)
-        # +stable: the nightly step above made nightly the default toolchain
-        # (same as release.yml).
+        # +$RUST_STABLE: the nightly step above made nightly the default
+        # toolchain (same as release.yml).
         run: |
           CARGO_SWIFT_VERSION=$(sed -n 's/^CARGO_SWIFT_VERSION="\([^"]*\)"$/\1/p' scripts/build-local.sh)
           if [ -z "$CARGO_SWIFT_VERSION" ]; then
             echo "::error file=scripts/build-local.sh::CARGO_SWIFT_VERSION not found"
             exit 1
           fi
-          cargo +stable install cargo-swift --version "$CARGO_SWIFT_VERSION" --locked
+          cargo +"$RUST_STABLE" install cargo-swift --version "$CARGO_SWIFT_VERSION" --locked
 
       - name: Build XCFramework (All Platforms)
         env:
@@ -152,11 +188,35 @@ jobs:
         run: ./scripts/build-local.sh
 
       - name: Upload Tier 3 XCFramework
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: SudachiSwift-Tier3.xcframework
           path: SudachiSwift.xcframework
           if-no-files-found: ignore
+
+  notices:
+    # A job of its own, so a stale file doesn't hide the build and test
+    # results: an upstream bump (new sudachi.rs commit, crate versions) always
+    # needs a regeneration, which the bump PR's checklist asks for.
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false # nothing below uses git credentials
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+
+      - name: Check THIRD_PARTY_NOTICES.md is up to date
+        # The script regenerates it from rust/Cargo.lock and the sudachi.rs
+        # submodule (cargo fetch + cargo metadata, no build) and fails if the
+        # committed file differs: run
+        # `python3 scripts/generate-third-party-notices.py` and commit it.
+        run: python3 scripts/generate-third-party-notices.py --check
 
   test:
     runs-on: macos-15
@@ -174,19 +234,20 @@ jobs:
       SUDACHI_DICT_V0_SHA256: 4729d134fd0b9852dacc89c59229664fee40642bb52bafcf4efb432cee9bb22c
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Also provides sudachi.rs/fetch_dictionary.sh.
           submodules: recursive
+          persist-credentials: false # nothing below uses git credentials
 
       - name: Download XCFramework artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: SudachiSwift.xcframework
           path: SudachiSwift.xcframework
 
       - name: Download Swift bindings
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: SudachiSwift-bindings
           path: Sources/SudachiSwift
@@ -218,7 +279,9 @@ jobs:
         # not a confusing char.def/parse error. Checked twice: BasicUsage's
         # dictionaryFormat(path:) pre-check, and the library itself, via the
         # tests/spm-consumer fixture calling Tokenizer.create on the file (it
-        # exits non-zero unless the error says "uses the legacy V0 format").
+        # exits non-zero unless the error says "uses the legacy V0 format", or
+        # if one of its dictionary-free checks, also run in the build job,
+        # fails against this artifact).
         # If upstream stops serving the V0 fixture, skip with a warning instead
         # of failing CI for an unrelated reason.
         run: |
