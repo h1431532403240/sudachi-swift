@@ -57,8 +57,10 @@ jobs:
 
       - name: Run Rust unit tests
         # Includes dictionary-format detection tests, which read
-        # sudachi.rs/sudachi/tests/resources from the submodule.
-        run: cargo test --manifest-path rust/Cargo.toml
+        # sudachi.rs/sudachi/tests/resources from the submodule. --locked:
+        # rust/Cargo.lock is tracked, so CI fails instead of silently resolving
+        # different dependency versions.
+        run: cargo test --locked --manifest-path rust/Cargo.toml
 
       - name: Build XCFramework + stage bindings (macOS + iOS)
         run: ./scripts/build-local.sh
@@ -106,13 +108,20 @@ jobs:
 
   build-tier3:
     runs-on: macos-15
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Also on manual dispatch, so the tvOS/visionOS nightly path can be tried
+    # on a branch (e.g. an upstream bump) before a release depends on it.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     continue-on-error: true
 
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Install Rust (stable)
+        # For `cargo +stable install` below; the nightly step after this one
+        # makes nightly the default toolchain.
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install Rust (nightly)
         uses: dtolnay/rust-toolchain@nightly
@@ -126,13 +135,15 @@ jobs:
           workspaces: rust
 
       - name: Install cargo-swift (version pinned in scripts/build-local.sh)
+        # +stable: the nightly step above made nightly the default toolchain
+        # (same as release.yml).
         run: |
           CARGO_SWIFT_VERSION=$(sed -n 's/^CARGO_SWIFT_VERSION="\([^"]*\)"$/\1/p' scripts/build-local.sh)
           if [ -z "$CARGO_SWIFT_VERSION" ]; then
             echo "::error file=scripts/build-local.sh::CARGO_SWIFT_VERSION not found"
             exit 1
           fi
-          cargo install cargo-swift --version "$CARGO_SWIFT_VERSION" --locked
+          cargo +stable install cargo-swift --version "$CARGO_SWIFT_VERSION" --locked
 
       - name: Build XCFramework (All Platforms)
         env:
@@ -180,6 +191,17 @@ jobs:
           name: SudachiSwift-bindings
           path: Sources/SudachiSwift
 
+      - name: Check the XCFramework artifact is at the repo root
+        # Root Package.swift uses ./SudachiSwift.xcframework only if it exists;
+        # otherwise it silently downloads the last published release, and
+        # everything below would test that binary instead of this build.
+        run: |
+          if [ ! -f SudachiSwift.xcframework/Info.plist ]; then
+            echo "::error::SudachiSwift.xcframework/Info.plist not found at the repo root; the artifact layout changed, so the tests would run against the published binary."
+            ls -la . SudachiSwift.xcframework 2>&1 || true
+            exit 1
+          fi
+
       - name: Download test dictionary (V1)
         # Upstream's script downloads the zip, checks its sha256, and writes
         # ./system.dic at the repo root, where BasicUsage's
@@ -192,11 +214,13 @@ jobs:
           SUDACHI_DICT_PATH="../../system.dic" swift run BasicUsage
 
       - name: Check that a legacy V0 dictionary is rejected
-        # A real V0 file must be refused up front with a "legacy V0" message
-        # (from BasicUsage's dictionaryFormat(path:) check or the library's
-        # DictionaryLoadError), not a confusing char.def/parse error. If upstream
-        # stops serving the V0 fixture, skip with a warning instead of failing CI
-        # for an unrelated reason.
+        # A real V0 file must be refused up front with a "legacy V0" message,
+        # not a confusing char.def/parse error. Checked twice: BasicUsage's
+        # dictionaryFormat(path:) pre-check, and the library itself, via the
+        # tests/spm-consumer fixture calling Tokenizer.create on the file (it
+        # exits non-zero unless the error says "uses the legacy V0 format").
+        # If upstream stops serving the V0 fixture, skip with a warning instead
+        # of failing CI for an unrelated reason.
         run: |
           mkdir -p dict-v0
           if ! (cd dict-v0 && sh ../sudachi.rs/fetch_dictionary.sh "$SUDACHI_DICT_VERSION" small v0 "$SUDACHI_DICT_V0_SHA256"); then
@@ -215,4 +239,9 @@ jobs:
             echo "::error::BasicUsage failed on the V0 dictionary, but without the 'legacy V0' message."
             exit 1
           fi
-          echo "V0 dictionary rejected as expected."
+          echo "BasicUsage rejected the V0 dictionary as expected."
+
+          # Library path: builds against ./SudachiSwift.xcframework (checked
+          # above) and fails the step unless Tokenizer.create throws the V0 error.
+          cd "$GITHUB_WORKSPACE/tests/spm-consumer"
+          SUDACHI_V0_DICT_PATH="$GITHUB_WORKSPACE/dict-v0/system.dic" swift run Verify
