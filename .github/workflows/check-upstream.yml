@@ -3,6 +3,12 @@
 # never touched again, so manual commits on the bump branch are never overwritten) and a bump
 # PR (draft if breaking or rust/ stops compiling). Also warns before GitHub auto-disables this
 # schedule (60 idle days) and opens an issue when this workflow fails.
+# Trust split: `probe` runs third-party code (`cargo check` runs upstream and crates.io build
+# scripts) with a read-only token and no secrets. It still holds the Actions runtime token
+# (artifact upload / cache), which is why release.yml does not restore caches. `report` holds
+# every write permission and the only secret reference, runs no third-party code, redoes the
+# deterministic bump itself and treats the probe's outputs and artifact as untrusted
+# (validated, size-capped, never executed).
 # Optional secret UPSTREAM_BOT_TOKEN (fine-grained PAT, this repo, Contents + Pull requests
 # read/write) lets the bump PR run build.yml normally; otherwise build.yml is dispatched.
 name: Check Upstream Updates
@@ -34,44 +40,50 @@ env:
   OWNER: ${{ github.repository_owner }}
 
 jobs:
-  check:
+  probe:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write      # push the bump branch
-      pull-requests: write # open / comment on the bump PR
-      issues: write        # labels + tracking issue
-      actions: write       # dispatch build.yml on the bump branch
-    env:
-      HAS_BOT_TOKEN: ${{ secrets.UPSTREAM_BOT_TOKEN != '' }}
-    # Steps share state via $GITHUB_ENV; upstream tags are validated (^v\d+\.\d+\.\d+$) first and
-    # never interpolated into script text. GH_TOKEN is per step: `cargo check` never sees it.
+      contents: read # checkout, branch lookup
+      issues: read   # tracking-issue dedupe
+    outputs:
+      new_release: ${{ steps.detect.outputs.new_release }}
+      latest: ${{ steps.detect.outputs.latest }}
+      pinned: ${{ steps.detect.outputs.pinned }}
+      kind: ${{ steps.detect.outputs.kind }}
+      caution: ${{ steps.detect.outputs.caution }}
+      branch_exists: ${{ steps.detect.outputs.branch_exists }}
+      superseded: ${{ steps.detect.outputs.superseded }}
+      compile: ${{ steps.check.outputs.compile }}
+    # Upstream tags are validated (^v\d+\.\d+\.\d+$) before use and never interpolated into scripts.
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
-          persist-credentials: false # no token in .git/config; create-pull-request brings its own
+          persist-credentials: false
 
       - name: Detect new upstream release
+        id: detect
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api "repos/$UPSTREAM/releases/latest" > "$RUNNER_TEMP/release.json"
-          LATEST=$(jq -r '.tag_name' "$RUNNER_TEMP/release.json")
-          jq -r '.body // ""' "$RUNNER_TEMP/release.json" > "$RUNNER_TEMP/release-body.md"
+          SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          # Highest stable vX.Y.Z by version: releases/latest is a manual flag a backport can carry.
+          gh api --paginate "repos/$UPSTREAM/releases?per_page=100" | jq -s 'add' > "$RUNNER_TEMP/releases.json"
+          LATEST=$(jq -r '.[] | select((.draft or .prerelease) | not) | .tag_name' "$RUNNER_TEMP/releases.json" \
+            | { grep -E "$SEMVER" || true; } | sort -V | tail -n 1)
+          if [ -z "$LATEST" ]; then echo "::error::No stable vX.Y.Z release found in $UPSTREAM"; exit 1; fi
+          jq -r --arg t "$LATEST" 'map(select(.tag_name == $t)) | first | .body // ""' "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/release-body.md"
           git -C sudachi.rs fetch --quiet --force --tags origin # after the API call: $LATEST's tag is fetched
-          if ! PINNED=$(git -C sudachi.rs describe --tags --exact-match --match 'v[0-9]*' HEAD); then
-            echo "::error::sudachi.rs submodule HEAD ($(git -C sudachi.rs rev-parse --short HEAD)) is not exactly on a release tag"
+          PINNED=$(git -C sudachi.rs tag --points-at HEAD | { grep -E "$SEMVER" || true; } | sort -V | tail -n 1)
+          if [ -z "$PINNED" ]; then
+            echo "::error::sudachi.rs submodule HEAD ($(git -C sudachi.rs rev-parse --short HEAD)) is not on a vX.Y.Z release tag"
             exit 1
           fi
-          SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+$'
-          for t in "$PINNED" "$LATEST"; do
-            if ! [[ $t =~ $SEMVER ]]; then echo "::error::Unexpected tag format: '$t'"; exit 1; fi
-          done
           PV=${PINNED#v} LV=${LATEST#v}
-          echo "Pinned submodule tag: $PINNED; latest upstream release: $LATEST"
+          echo "Pinned submodule tag: $PINNED; highest upstream release: $LATEST"
           if [ "$PV" = "$LV" ] || [ "$(printf '%s\n%s\n' "$PV" "$LV" | sort -V | tail -n 1)" != "$LV" ]; then
             echo "Nothing newer upstream than $PINNED." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -83,57 +95,189 @@ jobs:
           if grep -qiE 'breaking|caution|migration|dictionary (binary )?format' "$RUNNER_TEMP/release-body.md"; then CAUTION=true; fi
           TITLE="sudachi.rs $LATEST released" BRANCH="automation/sudachi-rs-$LATEST"
           echo "New upstream release $LATEST (pinned $PINNED): kind=$KIND caution=$CAUTION" | tee -a "$GITHUB_STEP_SUMMARY"
-          FOUND=$(gh issue list --state all --label upstream-update --limit 200 --json number,title,state \
-            | jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | if . == null then "" else "#\(.number) (\(.state))" end')
+          # REST listing: strongly consistent (`gh issue list --label` goes through search); drop PRs.
+          gh api --paginate "repos/$GH_REPO/issues?state=all&labels=upstream-update&per_page=100" \
+            | jq -s 'add | map(select(.pull_request == null))' > "$RUNNER_TEMP/tracking.json"
+          FOUND=$(jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | if . == null then "" else "#\(.number) (\(.state))" end' "$RUNNER_TEMP/tracking.json")
           if [ -n "$FOUND" ]; then
             echo "Tracking issue $FOUND exists: nothing to do (closed = skipped)." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          # Older tracking issues still open for versions newer than the pin, as "N:vX.Y.Z ...".
+          cat > "$RUNNER_TEMP/superseded.jq" << 'JQ'
+          def ver: ltrimstr("v") | split(".") | map(tonumber);
+          [sort_by(.number)[] | select(.state == "open")
+            | {n: .number, t: (.title | capture("^sudachi\\.rs (?<t>v[0-9]+\\.[0-9]+\\.[0-9]+) released$").t)}
+            | select((.t | ver) > ($p | ver)) | "\(.n):\(.t)"] | join(" ")
+          JQ
+          SUPERSEDED=$(jq -r --arg p "${PINNED#v}" -f "$RUNNER_TEMP/superseded.jq" "$RUNNER_TEMP/tracking.json")
           REFS=$(gh api "repos/$GH_REPO/git/matching-refs/heads/$BRANCH" | jq --arg r "refs/heads/$BRANCH" 'map(select(.ref == $r)) | length')
           BRANCH_EXISTS=false
           if [ "$REFS" -gt 0 ]; then BRANCH_EXISTS=true; fi
-          echo "No issue titled '$TITLE' yet; branch $BRANCH exists: $BRANCH_EXISTS"
-          printf '%s\n' NEW_RELEASE=true "PINNED=$PINNED" "LATEST=$LATEST" "VERSION=$LV" "KIND=$KIND" \
-            "CAUTION=$CAUTION" "TITLE=$TITLE" "BRANCH=$BRANCH" "BRANCH_EXISTS=$BRANCH_EXISTS" >> "$GITHUB_ENV"
+          echo "No issue titled '$TITLE' yet; branch $BRANCH exists: $BRANCH_EXISTS; open older tracking issues: ${SUPERSEDED:-none}"
+          printf '%s\n' new_release=true "latest=$LATEST" "pinned=$PINNED" "kind=$KIND" "caution=$CAUTION" \
+            "branch_exists=$BRANCH_EXISTS" "superseded=$SUPERSEDED" >> "$GITHUB_OUTPUT"
 
-      - if: env.NEW_RELEASE == 'true'
-        uses: dtolnay/rust-toolchain@stable
+      - if: steps.detect.outputs.new_release == 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
-      - name: Bump submodule, version and resources; cargo check
-        if: env.NEW_RELEASE == 'true'
+      # From here on build scripts run: anything this job writes later is untrusted in `report`.
+      - name: Bump submodule and version; cargo check
+        id: check
+        if: steps.detect.outputs.new_release == 'true'
+        env:
+          LATEST: ${{ steps.detect.outputs.latest }}
         run: |
           set -euo pipefail
+          export VERSION=${LATEST#v}
           git -C sudachi.rs -c advice.detachedHead=false checkout --quiet "refs/tags/$LATEST"
-          # shellcheck disable=SC2016 # $ENV{VERSION} is Perl; the first `version =` line is [package]'s
+          # $ENV{VERSION} is Perl's; the first `version =` line is [package]'s
           perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' rust/Cargo.toml
           grep -q "^version = \"$VERSION\"\$" rust/Cargo.toml
-          MISSING=""
-          for f in char.def unk.def rewrite.def sudachi.json; do
-            cp "sudachi.rs/resources/$f" Sources/SudachiSwift/Resources/ || MISSING="$MISSING $f"
-          done
-          git status --short
+          mkdir -p "$RUNNER_TEMP/probe"
           set +e
           CARGO_TARGET_DIR="$RUNNER_TEMP/target" cargo check --quiet --message-format short \
             --manifest-path rust/Cargo.toml 2>&1 | tee "$RUNNER_TEMP/cargo.log"
           RC=${PIPESTATUS[0]}
           set -e
           # Excerpt for the issue: last 60 lines without upstream's own (path dependency) warnings.
-          grep -v '/sudachi\.rs/.*: warning: ' "$RUNNER_TEMP/cargo.log" | tail -n 60 > "$RUNNER_TEMP/cargo-tail.log" || true
+          grep -v '/sudachi\.rs/.*: warning: ' "$RUNNER_TEMP/cargo.log" | tail -n 60 > "$RUNNER_TEMP/probe/cargo-tail.log" || true
+          if [ -f rust/Cargo.lock ]; then cp rust/Cargo.lock "$RUNNER_TEMP/probe/"; fi # as updated by cargo
           COMPILE=fail
           if [ "$RC" -eq 0 ]; then COMPILE=pass; fi
           echo "cargo check: $COMPILE (exit $RC)" | tee -a "$GITHUB_STEP_SUMMARY"
-          printf '%s\n' "COMPILE=$COMPILE" "MISSING=${MISSING# }" >> "$GITHUB_ENV"
+          echo "compile=$COMPILE" >> "$GITHUB_OUTPUT"
+
+      - if: steps.detect.outputs.new_release == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: probe
+          path: ${{ runner.temp }}/probe/
+          retention-days: 3
+          if-no-files-found: error
+
+  report:
+    needs: probe
+    if: needs.probe.outputs.new_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write      # push the bump branch
+      pull-requests: write # open / comment on the bump PR
+      issues: write        # labels, tracking issue, comments
+      actions: write       # dispatch build.yml on the bump branch
+    env:
+      HAS_BOT_TOKEN: ${{ secrets.UPSTREAM_BOT_TOKEN != '' }}
+      # Untrusted (set by a job that ran third-party code): validated before any use.
+      PROBE_LATEST: ${{ needs.probe.outputs.latest }}
+      PROBE_PINNED: ${{ needs.probe.outputs.pinned }}
+      PROBE_KIND: ${{ needs.probe.outputs.kind }}
+      PROBE_CAUTION: ${{ needs.probe.outputs.caution }}
+      PROBE_COMPILE: ${{ needs.probe.outputs.compile }}
+      PROBE_BRANCH_EXISTS: ${{ needs.probe.outputs.branch_exists }}
+      PROBE_SUPERSEDED: ${{ needs.probe.outputs.superseded }}
+    # Steps share validated state via $GITHUB_ENV. GH_TOKEN is per step. Dry run: print, write nothing.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false # no token in .git/config; create-pull-request brings its own
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: probe
+          path: ${{ runner.temp }}/probe
+
+      - name: Validate probe results; redo the bump without cargo
+        run: |
+          set -euo pipefail
+          SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+$' ENUMS='^(patch|breaking)/(true|false)/(pass|fail)/(true|false)$'
+          SUP_RE='^[0-9]+:v[0-9]+\.[0-9]+\.[0-9]+( [0-9]+:v[0-9]+\.[0-9]+\.[0-9]+)*$'
+          if ! [[ $PROBE_LATEST =~ $SEMVER && $PROBE_PINNED =~ $SEMVER ]] \
+            || ! [[ "$PROBE_KIND/$PROBE_CAUTION/$PROBE_COMPILE/$PROBE_BRANCH_EXISTS" =~ $ENUMS ]] \
+            || ! [[ -z $PROBE_SUPERSEDED || $PROBE_SUPERSEDED =~ $SUP_RE ]]; then
+            echo "::error::probe job outputs are malformed (not printed): refusing to continue"; exit 1
+          fi
+          git -C sudachi.rs fetch --quiet --force --tags origin
+          PINNED=$(git -C sudachi.rs tag --points-at HEAD | { grep -E "$SEMVER" || true; } | sort -V | tail -n 1)
+          LATEST=$PROBE_LATEST
+          export OLD=${PINNED#v} VERSION=${LATEST#v}
+          if [ "$PINNED" != "$PROBE_PINNED" ] || [ "$OLD" = "$VERSION" ] \
+            || [ "$(printf '%s\n%s\n' "$OLD" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
+            echo "::error::probe reported $PROBE_PINNED -> $LATEST, but this checkout pins '$PINNED'"; exit 1
+          fi
+          git -C sudachi.rs -c advice.detachedHead=false checkout --quiet "refs/tags/$LATEST"
+          perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' rust/Cargo.toml # as in probe
+          grep -q "^version = \"$VERSION\"\$" rust/Cargo.toml
+          MISSING=""
+          for f in char.def unk.def rewrite.def sudachi.json; do # regular files only: no symlinks out of the tree
+            R="sudachi.rs/resources/$f"
+            if [ -f "$R" ] && [ "$(realpath "$R")" = "$(pwd -P)/$R" ]; then cp "$R" Sources/SudachiSwift/Resources/; else MISSING="$MISSING $f"; fi
+          done
+          # Install pins `.package(url: "https://github.com/<owner>/sudachi-swift", exact: "<old>[-nightly]")`
+          # in the README and (commented) in the example manifests, plus the README's sudachi.rs badge.
+          PIN_FILES="README.md Examples/BasicUsage/Package.swift Examples/iOSApp/Package.swift"
+          # shellcheck disable=SC2086 # word splitting intended
+          perl -pi -e 's{^(\s*(?://\s*)?\.package\(url: "https://github\.com/[^"/]+/sudachi-swift", exact: ")\Q$ENV{OLD}\E((?:-nightly)?"\))}{$1$ENV{VERSION}$2}' $PIN_FILES
+          perl -pi -e 'if (m{img\.shields\.io/badge/sudachi\.rs-v}) { s{v\Q$ENV{OLD}\E(?=[-)])}{v$ENV{VERSION}}g }' README.md
+          # shellcheck disable=SC2086
+          PINS=$(git diff --numstat -- $PIN_FILES | awk '{ n += $1 } END { print n + 0 }')
+          # Cargo.lock as updated by the probe's cargo check: accepted only if it pins crates.io packages only.
+          P="$RUNNER_TEMP/probe/Cargo.lock" LOCK="not produced by the probe; left as is"
+          if [ -f "$P" ]; then
+            if [ "$(wc -c < "$P")" -le 1048576 ] && [ "$(head -n 1 "$P")" = '# This file is automatically @generated by Cargo.' ] \
+              && awk '/^[ \t]*source[ \t]*=/ && $0 != "source = \"registry+https://github.com/rust-lang/crates.io-index\"" { bad = 1 } END { exit bad }' "$P"; then
+              cp "$P" rust/Cargo.lock; LOCK="updated by the probe's \`cargo check\`"
+            else
+              LOCK="**rejected** (not a crates.io-only Cargo.lock), left as is"; echo "::warning::Ignoring the probe's Cargo.lock"
+            fi
+          fi
+          if git check-ignore -q rust/Cargo.lock; then LOCK="$LOCK (gitignored and untracked here: not committed)"; fi
+          git status --short
+          git diff -- README.md Examples
+          {
+            printf '%s\n' "LATEST=$LATEST" "PINNED=$PINNED" "VERSION=$VERSION" "OLD=$OLD" "KIND=$PROBE_KIND" \
+              "CAUTION=$PROBE_CAUTION" "COMPILE=$PROBE_COMPILE" "BRANCH_EXISTS=$PROBE_BRANCH_EXISTS" \
+              "SUPERSEDED=$PROBE_SUPERSEDED" "TITLE=sudachi.rs $LATEST released" "BRANCH=automation/sudachi-rs-$LATEST" \
+              "MISSING=${MISSING# }" "PINS=${PINS:-0}" "LOCK=$LOCK" 'ADD_PATHS<<EOF_ADD_PATHS'
+            printf '%s\n' sudachi.rs rust/Cargo.toml Sources/SudachiSwift/Resources README.md Examples/BasicUsage/Package.swift Examples/iOSApp/Package.swift
+            if [ -f rust/Cargo.lock ] && ! git check-ignore -q rust/Cargo.lock; then echo rust/Cargo.lock; fi
+            echo EOF_ADD_PATHS
+          } >> "$GITHUB_ENV"
 
       - name: Open tracking issue
-        if: env.NEW_RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Re-check with this job's own token: probe's snapshot is untrusted, and stale on "Re-run failed jobs".
+          gh api --paginate "repos/$GH_REPO/issues?state=all&labels=upstream-update&per_page=100" \
+            | jq -s 'add | map(select(.pull_request == null))' > "$RUNNER_TEMP/tracking.json"
+          FOUND=$(jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | .number // empty' "$RUNNER_TEMP/tracking.json")
+          REFS=$(gh api "repos/$GH_REPO/git/matching-refs/heads/$BRANCH" | jq --arg r "refs/heads/$BRANCH" 'map(select(.ref == $r)) | length')
+          BRANCH_EXISTS=false
+          if [ "$REFS" -gt 0 ]; then BRANCH_EXISTS=true; fi
+          # Older tracking issues still open for versions newer than the pin, as "N:vX.Y.Z ...".
+          cat > "$RUNNER_TEMP/superseded.jq" << 'JQ'
+          def ver: ltrimstr("v") | split(".") | map(tonumber);
+          [sort_by(.number)[] | select(.state == "open")
+            | {n: .number, t: (.title | capture("^sudachi\\.rs (?<t>v[0-9]+\\.[0-9]+\\.[0-9]+) released$").t)}
+            | select((.t | ver) > ($p | ver)) | "\(.n):\(.t)"] | join(" ")
+          JQ
+          SUPERSEDED=$(jq -r --arg p "${PINNED#v}" -f "$RUNNER_TEMP/superseded.jq" "$RUNNER_TEMP/tracking.json")
+          # Re-run after the issue was created: reuse it (no 2nd issue, no repeated comments); the PR is opened only while the branch is missing.
+          if [ -n "$FOUND" ]; then echo "Tracking issue #$FOUND already exists (re-run?): reusing it."; SUPERSEDED=""; fi
           U="https://github.com/$UPSTREAM"
-          LABELS=upstream-update DRAFT=false
+          LABELS=upstream-update DRAFT=false MIGRATE=false
           if [ "$KIND" = breaking ]; then LABELS+=",upstream:breaking" DRAFT=true; fi
           if [ "$COMPILE" = fail ]; then LABELS+=",upstream:compile-fail" DRAFT=true; fi
+          if [ "$KIND" = breaking ] || [ "$CAUTION" = true ] || [ "$COMPILE" = fail ]; then MIGRATE=true; fi
+          # Untrusted excerpt: size-capped, in a fence longer than any backtick run in it (>= 8).
+          tail -n 60 "$RUNNER_TEMP/probe/cargo-tail.log" 2> /dev/null | tail -c 16000 | awk 1 > "$RUNNER_TEMP/excerpt.log" || true
+          FENCE=$(perl -ne 'while (/(`+)/g) { $m = length $1 if length $1 > $m } END { print "`" x ($m >= 8 ? $m + 1 : 8) }' "$RUNNER_TEMP/excerpt.log")
           {
             echo "Upstream sudachi.rs released **$LATEST**: $U/releases/tag/$LATEST"
             echo
@@ -141,30 +285,40 @@ jobs:
             echo "- Classification: **$KIND** (breaking = major bump, or minor bump while major is 0)"
             echo "- Release notes mention breaking / caution / migration / dictionary format: **$CAUTION**"
             echo "- \`cargo check\` of \`rust/\` against $LATEST: **$COMPILE**"
-            if [ -n "$MISSING" ]; then echo "- Bundled resources not found upstream (not refreshed): $MISSING"; fi
+            echo "- Version pins \`exact: \"$OLD\"\` / \`\"$OLD-nightly\"\` (README, example manifests) and the README badge → \`$VERSION\`: **$PINS** line(s) updated"
+            echo "- \`rust/Cargo.lock\`: $LOCK"
+            if [ -n "$MISSING" ]; then echo "- Bundled resources missing upstream or not regular files (not refreshed): $MISSING"; fi
+            for S in $SUPERSEDED; do echo "- Supersedes #${S%%:*} (branch \`automation/sudachi-rs-${S#*:}\` may hold migration commits)"; done
             if [ "$COMPILE" = fail ]; then
-              printf '\n<details><summary>cargo check output (last 60 lines, upstream warnings omitted)</summary>\n\n```text\n'
-              cat "$RUNNER_TEMP/cargo-tail.log"
-              printf '```\n\n</details>\n'
+              printf '\n<details><summary>cargo check output (last 60 lines, upstream warnings omitted)</summary>\n\n%stext\n' "$FENCE"
+              cat "$RUNNER_TEMP/excerpt.log"
+              printf '%s\n\n</details>\n' "$FENCE"
             fi
             echo
-            if [ "$KIND" = breaking ] || [ "$CAUTION" = true ]; then
-              echo "### Migration checklist"
-              echo "- [ ] Read the release notes, [migration guide]($U/blob/$LATEST/docs/migration_guide.md) and [CHANGELOG]($U/blob/$LATEST/CHANGELOG.md)"
+            if [ "$MIGRATE" = true ]; then echo "### Migration checklist"; else echo "### Checklist"; fi
+            echo "- [ ] Read the upstream [CHANGELOG]($U/blob/$LATEST/CHANGELOG.md) for $LATEST: 0.x patch releases may change analysis results"
+            if [ "$MIGRATE" = true ]; then
+              echo "- [ ] Read the [release notes]($U/releases/tag/$LATEST) and the [migration guide]($U/blob/$LATEST/docs/migration_guide.md)"
               echo "- [ ] Fix \`rust/src/lib.rs\` until \`cargo check --manifest-path rust/Cargo.toml\` passes"
               echo "- [ ] Check bundled resources and whether the dictionary format changed (download URLs, CI test dictionary)"
-              echo "- [ ] Update README / docs (API changes, recommended SPM version requirement, notes for users)"
-              echo "- [ ] Merge, then run the **Release** workflow with version \`$VERSION\`"
-            else
-              echo "Review the bump PR and its CI, merge, then run the **Release** workflow with version \`$VERSION\`."
+              echo "- [ ] Update README / docs (API changes, notes for users)"
             fi
+            if [ "$PINS" -gt 0 ]; then
+              echo "- [ ] Review the version pins the bump PR updated ($PINS line(s)); other mentions of \`$OLD\` (e.g. upgrade notes) are left alone"
+            else
+              echo "- [ ] Update the README version pins by hand: no \`exact: \"$OLD\"\` install line was found"
+            fi
+            echo "- [ ] Merge, then run the **Release** workflow with version \`$VERSION\`"
             echo
             if [ "$BRANCH_EXISTS" = true ]; then echo "Branch \`$BRANCH\` already exists, so no PR was opened (it is never overwritten)."; echo; fi
             echo "**Close this issue to skip this release**: the workflow never touches $LATEST again once this issue exists."
           } > "$RUNNER_TEMP/issue.md"
           if [ "$DRY_RUN" = true ]; then
-            echo "[dry run] would create issue '$TITLE' (labels $LABELS; assignee $OWNER):"; cat "$RUNNER_TEMP/issue.md"
+            echo "[dry run] would create issue '$TITLE' (labels $LABELS; assignee $OWNER):"
+            sed 's/^/  | /' "$RUNNER_TEMP/issue.md" # prefixed: excerpt lines can't act as workflow commands
             ISSUE=""
+          elif [ -n "$FOUND" ]; then
+            ISSUE=$FOUND
           else
             gh label create upstream-update --force --color 0E8A16 --description "New upstream sudachi.rs release"
             gh label create upstream:breaking --force --color B60205 --description "Upstream release needs a manual migration"
@@ -174,18 +328,25 @@ jobs:
             ISSUE=${URL##*/}
             echo "Tracking issue: $URL" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
+          for S in $SUPERSEDED; do
+            MSG="Superseded by #${ISSUE:-new} (sudachi.rs $LATEST). Branch \`automation/sudachi-rs-${S#*:}\` may hold migration commits that the new bump PR (from the default branch) lacks: carry them over before closing this issue."
+            if [ "$DRY_RUN" = true ]; then echo "[dry run] would comment on #${S%%:*}: $MSG"; else gh issue comment "${S%%:*}" --body "$MSG"; fi
+          done
           printf '%s\n\n%s\n\nCloses #%s\n' \
-            "Bumps \`sudachi.rs\` \`$PINNED\` → \`$LATEST\`, \`rust/Cargo.toml\` version → \`$VERSION\`, and refreshes \`Sources/SudachiSwift/Resources/\` from \`sudachi.rs/resources/\`. Kind **$KIND**, release-notes caution **$CAUTION**, cargo check **$COMPILE** (details in #${ISSUE:-new})." \
+            "Bumps \`sudachi.rs\` \`$PINNED\` → \`$LATEST\`, \`rust/Cargo.toml\` version and the README install pins ($PINS line(s)) → \`$VERSION\`, and refreshes \`Sources/SudachiSwift/Resources/\` from \`sudachi.rs/resources/\`; \`rust/Cargo.lock\` $LOCK. Kind **$KIND**, release-notes caution **$CAUTION**, cargo check **$COMPILE** (details in #${ISSUE:-new})." \
             "Mechanical bump only: push migration commits to this branch; the workflow never touches it again." \
             "${ISSUE:-new}" > "$RUNNER_TEMP/pr.md"
-          if [ "$DRY_RUN" = true ]; then echo "[dry run] would open PR from $BRANCH unless it exists ($BRANCH_EXISTS); draft $DRAFT:"; cat "$RUNNER_TEMP/pr.md"; fi
-          printf '%s\n' "ISSUE=$ISSUE" "LABELS=$LABELS" "DRAFT=$DRAFT" >> "$GITHUB_ENV"
+          if [ "$DRY_RUN" = true ]; then
+            echo "[dry run] would open PR from $BRANCH unless it exists ($BRANCH_EXISTS); draft $DRAFT; paths: ${ADD_PATHS//$'\n'/ }"
+            cat "$RUNNER_TEMP/pr.md"
+          fi
+          printf '%s\n' "ISSUE=$ISSUE" "LABELS=$LABELS" "DRAFT=$DRAFT" "BRANCH_EXISTS=$BRANCH_EXISTS" >> "$GITHUB_ENV"
 
       - name: Open bump PR
         id: cpr
-        if: env.NEW_RELEASE == 'true' && env.BRANCH_EXISTS == 'false' && env.DRY_RUN != 'true'
+        if: env.BRANCH_EXISTS == 'false' && env.DRY_RUN != 'true'
         continue-on-error: true
-        uses: peter-evans/create-pull-request@v8
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.UPSTREAM_BOT_TOKEN || github.token }}
           branch: ${{ env.BRANCH }}
@@ -195,13 +356,13 @@ jobs:
           labels: ${{ env.LABELS }}
           assignees: ${{ github.repository_owner }}
           draft: ${{ env.DRAFT }}
-          add-paths: |
-            sudachi.rs
-            rust/Cargo.toml
-            Sources/SudachiSwift/Resources
+          # sudachi.rs, rust/Cargo.toml, Sources/SudachiSwift/Resources, README.md, the example
+          # manifests, and rust/Cargo.lock when present and not gitignored (a missing path would
+          # make `git add` stage nothing).
+          add-paths: ${{ env.ADD_PATHS }}
 
       - name: Report PR result / dispatch CI
-        if: env.NEW_RELEASE == 'true' && env.BRANCH_EXISTS == 'false' && env.DRY_RUN != 'true'
+        if: env.BRANCH_EXISTS == 'false' && env.DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_OUTCOME: ${{ steps.cpr.outcome }}
@@ -235,8 +396,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: read
-      issues: write
+      contents: read # last commit date
+      issues: write  # warning issue
     steps:
       - name: Warn before GitHub disables this schedule
         env:
@@ -252,16 +413,19 @@ jobs:
           OFF_DAY=$(jq -rn --argjson t "$LAST_TS" '$t + 60 * 86400 | strftime("%Y-%m-%d")')
           echo "Last commit on $BRANCH: $LAST ($DAYS days ago); GitHub would disable this schedule around $OFF_DAY."
           PREFIX="Scheduled upstream check needs activity"
-          ISSUES=$(gh issue list --state all --label workflow-health --limit 200 --json number,title,state)
-          if [ "$DAYS" -lt "$WARN_DAYS" ]; then
-            for N in $(jq -r --arg p "$PREFIX" '.[] | select(.state == "OPEN" and (.title | startswith($p))) | .number' <<< "$ISSUES"); do
-              if [ "$DRY_RUN" = true ]; then echo "[dry run] would close #$N"; continue; fi
-              gh issue close "$N" --comment "Resolved: the last commit on \`$BRANCH\` is from $LAST_DAY ($DAYS days ago)."
-            done
-            exit 0
-          fi
-          TITLE="$PREFIX (last push $LAST_DAY)"
-          N=$(jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | .number // empty' <<< "$ISSUES")
+          TITLE="$PREFIX (last commit $LAST_DAY)" KEEP=""
+          if [ "$DAYS" -ge "$WARN_DAYS" ]; then KEEP=$TITLE; fi
+          gh api --paginate "repos/$GH_REPO/issues?state=all&labels=workflow-health&per_page=100" \
+            | jq -s 'add | map(select(.pull_request == null))' > "$RUNNER_TEMP/health.json"
+          # Close open warnings: all once active again; while inactive, those for an older commit date.
+          for N in $(jq -r --arg p "$PREFIX" --arg k "$KEEP" '.[] | select(.state == "open" and (.title | startswith($p)) and .title != $k) | .number' "$RUNNER_TEMP/health.json"); do
+            C="Resolved: the last commit on \`$BRANCH\` is from $LAST_DAY ($DAYS days ago)."
+            if [ -n "$KEEP" ]; then C="Superseded by the warning for the last commit on $LAST_DAY ($DAYS days ago)."; fi
+            if [ "$DRY_RUN" = true ]; then echo "[dry run] would close #$N: $C"; continue; fi
+            gh issue close "$N" --comment "$C"
+          done
+          if [ -z "$KEEP" ]; then exit 0; fi
+          N=$(jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | .number // empty' "$RUNNER_TEMP/health.json")
           if [ -n "$N" ]; then echo "Warning issue #$N already exists."; exit 0; fi
           printf '%s\n\n%s\n\n%s\n%s\n' "No commit has landed on \`$BRANCH\` since **$LAST_DAY** ($DAYS days ago)." \
             "GitHub disables scheduled workflows in public repositories after 60 days without repository activity (this workflow's own runs do not count): expected around **$OFF_DAY**. After that new sudachi.rs releases are not detected and nobody is notified." \
@@ -275,12 +439,12 @@ jobs:
           gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/inactive.md" --label workflow-health --assignee "$OWNER"
 
   alert:
-    needs: [check, inactivity]
+    needs: [probe, report, inactivity]
     if: failure() && inputs.dry_run != true
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      issues: write
+      issues: write # failure issue
     steps:
       - name: Open or update the failure issue
         env:
@@ -290,8 +454,8 @@ jobs:
           set -euo pipefail
           TITLE="check-upstream workflow is failing"
           gh label create workflow-health --force --color FBCA04 --description "Automation needs the maintainer's attention"
-          N=$(gh issue list --state open --label workflow-health --limit 200 --json number,title \
-            | jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | .number // empty')
+          N=$(gh api --paginate "repos/$GH_REPO/issues?state=open&labels=workflow-health&per_page=100" \
+            | jq -rs --arg t "$TITLE" 'add | map(select(.pull_request == null and .title == $t)) | first | .number // empty')
           if [ -n "$N" ]; then gh issue comment "$N" --body "Failed again: $RUN_URL"; exit 0; fi
           gh issue create --title "$TITLE" --label workflow-health --assignee "$OWNER" --body \
             "The scheduled upstream check failed: $RUN_URL. New sudachi.rs releases may go unnoticed until it is fixed. Later failures are added here as comments; close this issue once fixed."
