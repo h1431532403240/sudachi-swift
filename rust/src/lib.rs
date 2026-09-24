@@ -2,16 +2,20 @@
 //!
 //! This crate provides UniFFI bindings to expose sudachi.rs functionality to Swift.
 
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use sudachi::analysis::mlist::MorphemeList;
 use sudachi::analysis::morpheme::Morpheme;
 use sudachi::analysis::stateful_tokenizer::StatefulTokenizer;
-use sudachi::analysis::stateless_tokenizer::DictionaryAccess;
 use sudachi::analysis::Mode as SudachiMode;
-use sudachi::config::ConfigBuilder;
+use sudachi::config::Config;
 use sudachi::dic::dictionary::JapaneseDictionary;
+use sudachi::dic::header::HeaderVersion;
 use sudachi::dic::subset::InfoSubset;
+use sudachi::dic::DictionaryAccess;
 use sudachi::sentence_splitter::{SentenceSplitter, SplitSentences};
 
 uniffi::setup_scaffolding!();
@@ -84,10 +88,11 @@ pub struct MorphemeInfo {
     pub end: u32,
     /// Part-of-speech numeric ID
     pub part_of_speech_id: u32,
-    /// Dictionary ID (-1 for system, 0+ for user dicts, -1 for OOV / unknown)
+    /// Dictionary ID (0 for the system dictionary, 1+ for user dictionaries
+    /// in the order given, -1 for OOV)
     pub dictionary_id: i32,
     /// Synonym group IDs this morpheme belongs to
-    pub synonym_group_ids: Vec<u32>,
+    pub synonym_group_ids: Vec<i32>,
     /// Start Unicode codepoint offset in the original text (matches Python's
     /// `Morpheme.begin()`).
     pub begin_char: u32,
@@ -125,10 +130,13 @@ pub struct SentenceRange {
 pub struct TokenizerConfig {
     /// Path to the system dictionary file (.dic)
     pub dictionary_path: String,
-    /// Optional path to sudachi.json config file
+    /// Optional path to sudachi.json config file. When omitted, the default
+    /// config embedded in sudachi.rs is used.
     pub config_path: Option<String>,
-    /// Optional path to resource directory (where char.def, unk.def are located)
-    /// If not provided, will use the parent directory of config_path or dictionary_path
+    /// Optional resource directory (where char.def, unk.def, rewrite.def are
+    /// located). Resources are resolved in sudachi.rs order: this directory,
+    /// then the config's `path` field, then the config file's directory, then
+    /// the defaults embedded in sudachi.rs.
     pub resource_path: Option<String>,
     /// User dictionary files, applied in order. Mirrors the `userDict` array
     /// in `sudachi.json`.
@@ -165,55 +173,32 @@ pub struct Tokenizer {
     dictionary: Arc<JapaneseDictionary>,
 }
 
-// `ConfigBuilder::empty()` produces a config without an OOV plugin, so
-// `JapaneseDictionary::from_cfg` fails with "No out of vocabulary plugin
-// provided" — fall back to the embedded upstream sudachi.json when the
-// caller didn't supply a config_path.
-const DEFAULT_SUDACHI_JSON_BYTES: &[u8] =
-    include_bytes!("../../sudachi.rs/resources/sudachi.json");
-
 #[uniffi::export]
 impl Tokenizer {
     #[uniffi::constructor]
     pub fn new(config: TokenizerConfig) -> Result<Arc<Self>, SudachiError> {
-        use std::path::Path;
-
-        let mut builder = match &config.config_path {
-            Some(path) => ConfigBuilder::from_file(path.as_ref())
-                .map_err(|e| SudachiError::ConfigError {
-                    message: e.to_string(),
-                })?,
-            None => ConfigBuilder::from_bytes(DEFAULT_SUDACHI_JSON_BYTES).map_err(|e| {
-                SudachiError::ConfigError {
-                    message: e.to_string(),
-                }
-            })?,
-        };
-
-        builder = builder.system_dict(&config.dictionary_path);
-
-        let resource_path = config.resource_path.clone().or_else(|| {
-            config
-                .config_path
-                .as_ref()
-                .and_then(|p| Path::new(p).parent())
-                .or_else(|| Path::new(&config.dictionary_path).parent())
-                .map(|p| p.to_string_lossy().to_string())
-        });
-
-        if let Some(res_path) = resource_path {
-            builder = builder.resource_path(res_path);
-        }
-
+        ensure_loadable_format(&config.dictionary_path, "System dictionary")?;
         for user_dict in &config.user_dictionary_paths {
-            builder = builder.user_dict(user_dict);
+            ensure_loadable_format(user_dict, "User dictionary")?;
         }
 
-        let dictionary = JapaneseDictionary::from_cfg(&builder.build()).map_err(|e| {
-            SudachiError::DictionaryLoadError {
-                message: e.to_string(),
-            }
+        // Same construction as sudachi.rs's own CLI / Python binding
+        // (`Config::new`), so resource resolution follows upstream.
+        let mut cfg = Config::new(
+            config.config_path.as_ref().map(PathBuf::from),
+            config.resource_path.as_ref().map(PathBuf::from),
+            Some(PathBuf::from(&config.dictionary_path)),
+        )
+        .map_err(|e| SudachiError::ConfigError {
+            message: e.to_string(),
         })?;
+        cfg.user_dicts
+            .extend(config.user_dictionary_paths.iter().map(PathBuf::from));
+
+        let dictionary =
+            JapaneseDictionary::from_cfg(&cfg).map_err(|e| SudachiError::DictionaryLoadError {
+                message: e.to_string(),
+            })?;
 
         Ok(Arc::new(Self {
             dictionary: Arc::new(dictionary),
@@ -265,11 +250,11 @@ impl Tokenizer {
         for m in morphemes.iter() {
             let info = morpheme_to_info(&m);
             sub_list.clear();
-            let did_split = m
-                .split_into(sub_sudachi_mode, &mut sub_list)
-                .map_err(|e| SudachiError::TokenizeError {
+            let did_split = m.split_into(sub_sudachi_mode, &mut sub_list).map_err(|e| {
+                SudachiError::TokenizeError {
                     message: e.to_string(),
-                })?;
+                }
+            })?;
 
             let subunits: Vec<MorphemeInfo> = if did_split && !sub_list.is_empty() {
                 sub_list.iter().map(|sm| morpheme_to_info(&sm)).collect()
@@ -288,8 +273,12 @@ impl Tokenizer {
         Ok(results)
     }
 
-    /// Look up dictionary entries whose surface matches `query` exactly.
+    /// Look up dictionary entries whose surface matches `query`.
     /// Mirrors `Dictionary.lookup(surface)` in the Python binding.
+    ///
+    /// Since sudachi.rs 0.7 the query is first normalized by the dictionary's
+    /// input-text plugins (e.g. full-width → half-width), so the returned
+    /// `surface` and offsets refer to the normalized query, not `query`.
     pub fn lookup(&self, query: String) -> Result<Vec<MorphemeInfo>, SudachiError> {
         let mut list: MorphemeList<Arc<JapaneseDictionary>> =
             MorphemeList::empty(self.dictionary.clone());
@@ -341,7 +330,7 @@ impl Tokenizer {
     }
 }
 
-fn collect_sentences<'a, S: SplitSentences>(splitter: S, text: &'a str) -> Vec<SentenceRange> {
+fn collect_sentences<S: SplitSentences>(splitter: S, text: &str) -> Vec<SentenceRange> {
     splitter
         .split(text)
         .map(|(range, slice)| SentenceRange {
@@ -365,6 +354,60 @@ pub fn get_version() -> String {
 #[uniffi::export]
 pub fn split_sentences(text: String) -> Vec<SentenceRange> {
     collect_sentences(SentenceSplitter::new(), &text)
+}
+
+// ============ Dictionary Format ============
+
+/// Binary format of a Sudachi dictionary file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DictionaryFormat {
+    /// Binary format V1, the only format sudachi.rs 0.7+ can load.
+    V1,
+    /// Legacy format used by sudachi.rs 0.6 and earlier. Download a V1 build
+    /// of the system dictionary and rebuild user dictionaries against it.
+    LegacyV0,
+    /// Unreadable, not a Sudachi dictionary, or a format this version does
+    /// not know.
+    Unknown,
+}
+
+/// First bytes of a V1 dictionary (sudachi.rs `dic/description.rs`).
+const V1_MAGIC_BYTES: &[u8] = b"SudachiBinaryDic";
+
+/// Detect the binary format of the dictionary file at `path` by reading its
+/// header only. Useful for deciding whether a previously downloaded `.dic`
+/// needs to be replaced.
+#[uniffi::export]
+pub fn dictionary_format(path: String) -> DictionaryFormat {
+    let mut header = [0u8; 16];
+    let read = File::open(&path).and_then(|mut f| f.read_exact(&mut header));
+    if read.is_err() {
+        return DictionaryFormat::Unknown;
+    }
+    if header == V1_MAGIC_BYTES {
+        return DictionaryFormat::V1;
+    }
+    let legacy_version = u64::from_le_bytes(header[..8].try_into().unwrap());
+    match HeaderVersion::from_u64(legacy_version) {
+        Some(_) => DictionaryFormat::LegacyV0,
+        None => DictionaryFormat::Unknown,
+    }
+}
+
+/// Fail early with an actionable message for V0 dictionaries. sudachi.rs
+/// reads resources before the dictionary header, so without this check a V0
+/// dictionary can surface as an unrelated char.def error.
+fn ensure_loadable_format(path: &str, kind: &str) -> Result<(), SudachiError> {
+    if dictionary_format(path.to_string()) != DictionaryFormat::LegacyV0 {
+        return Ok(());
+    }
+    Err(SudachiError::DictionaryLoadError {
+        message: format!(
+            "{kind} {path} uses the legacy V0 format, which SudachiSwift 0.7+ (sudachi.rs 0.7+) cannot read. \
+             Download a V1 dictionary from https://d2ej7fkh96fzlu.cloudfront.net/sudachidict/v1/ \
+             and rebuild user dictionaries against it."
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -405,6 +448,122 @@ mod tests {
         assert_eq!(sentences[0].begin, 0);
         assert_eq!(sentences[0].end, sentences[1].begin);
         assert_eq!(sentences.last().unwrap().end as usize, text.len());
+    }
+
+    fn upstream_test_resources() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sudachi.rs/sudachi/tests/resources")
+    }
+
+    /// Write `bytes` to a fresh file under the system temp dir.
+    fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sudachi-swift-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn test_dictionary_config() -> TokenizerConfig {
+        // Built-in plugin class names; the upstream test sudachi.json uses
+        // `$exe/...` dynamic plugins, which this crate does not ship.
+        let config = r#"{
+            "characterDefinitionFile": "char.def",
+            "inputTextPlugin": [{ "class": "com.worksap.nlp.sudachi.DefaultInputTextPlugin" }],
+            "oovProviderPlugin": [{
+                "class": "com.worksap.nlp.sudachi.SimpleOovPlugin",
+                "oovPOS": ["名詞", "普通名詞", "一般", "*", "*", "*"],
+                "leftId": 8, "rightId": 8, "cost": 6000
+            }],
+            "pathRewritePlugin": [{
+                "class": "com.worksap.nlp.sudachi.JoinNumericPlugin",
+                "enableNormalize": true
+            }]
+        }"#;
+        let resources = upstream_test_resources();
+        TokenizerConfig {
+            dictionary_path: resources.join("system.dic.test").to_string_lossy().into(),
+            config_path: Some(
+                temp_file("sudachi.json", config.as_bytes())
+                    .to_string_lossy()
+                    .into(),
+            ),
+            resource_path: Some(resources.to_string_lossy().into()),
+            user_dictionary_paths: vec![resources.join("user.dic.test").to_string_lossy().into()],
+        }
+    }
+
+    #[test]
+    fn test_dictionary_format_detection() {
+        let resources = upstream_test_resources();
+        let path = |name: &str| resources.join(name).to_string_lossy().to_string();
+        assert_eq!(
+            dictionary_format(path("system.dic.test")),
+            DictionaryFormat::V1
+        );
+        assert_eq!(
+            dictionary_format(path("user.dic.test")),
+            DictionaryFormat::V1
+        );
+
+        // Legacy system dictionary header (SYSTEM_DICT_VERSION_2) followed by padding.
+        let mut v0 = 0xce9f011a92394434u64.to_le_bytes().to_vec();
+        v0.extend_from_slice(&[0u8; 32]);
+        let v0_path = temp_file("v0.dic", &v0);
+        assert_eq!(
+            dictionary_format(v0_path.to_string_lossy().into()),
+            DictionaryFormat::LegacyV0
+        );
+
+        let garbage = temp_file("garbage.dic", b"definitely not a sudachi dictionary");
+        assert_eq!(
+            dictionary_format(garbage.to_string_lossy().into()),
+            DictionaryFormat::Unknown
+        );
+        let short = temp_file("short.dic", b"Sudachi");
+        assert_eq!(
+            dictionary_format(short.to_string_lossy().into()),
+            DictionaryFormat::Unknown
+        );
+        assert_eq!(
+            dictionary_format("/nonexistent/system.dic".into()),
+            DictionaryFormat::Unknown
+        );
+    }
+
+    #[test]
+    fn test_legacy_dictionary_is_rejected_with_actionable_message() {
+        let mut v0 = 0xce9f011a92394434u64.to_le_bytes().to_vec();
+        v0.extend_from_slice(&[0u8; 32]);
+        let v0_path = temp_file("legacy.dic", &v0);
+        let err = match Tokenizer::with_dictionary(v0_path.to_string_lossy().into()) {
+            Ok(_) => panic!("a V0 dictionary must not load"),
+            Err(e) => e,
+        };
+        match err {
+            SudachiError::DictionaryLoadError { message } => {
+                assert!(message.contains("legacy V0"), "{message}");
+                assert!(message.contains("sudachidict/v1/"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tokenize_with_upstream_test_dictionary() {
+        let tokenizer = Tokenizer::new(test_dictionary_config()).unwrap();
+        let morphemes = tokenizer
+            .tokenize("東京都".into(), TokenizeMode::C)
+            .unwrap();
+        let surfaces: Vec<&str> = morphemes.iter().map(|m| m.surface.as_str()).collect();
+        assert_eq!(surfaces.concat(), "東京都");
+        assert!(morphemes.iter().all(|m| !m.part_of_speech.is_empty()));
+
+        let pos_id = morphemes[0].part_of_speech_id;
+        assert_eq!(
+            tokenizer.pos_of(pos_id),
+            Some(morphemes[0].part_of_speech.clone())
+        );
+        assert!(!tokenizer.lookup("東京".into()).unwrap().is_empty());
     }
 
     #[test]

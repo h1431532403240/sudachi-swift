@@ -72,13 +72,18 @@ extension Tokenizer {
     ///
     /// ## Getting a `.dic`
     ///
-    /// The dictionary file itself ships separately from this package — it's
-    /// 50 MB – 1 GB depending on which distribution you pick. See
+    /// The dictionary file itself ships separately from this package — the
+    /// zip is 40 – 140 MB depending on which distribution you pick. See
     /// ``SudachiDictDistribution`` for download URLs and
     /// ``SudachiDictionaryStore`` for conventional install paths.
     ///
-    /// **iOS / app bundle:** download a `sudachi-dictionary-*.zip` from
-    /// https://github.com/WorksApplications/SudachiDict on your dev machine,
+    /// The dictionary must be in binary format **V1** (sudachi.rs 0.7+). V0
+    /// dictionaries from SudachiSwift 0.6 and earlier fail to load with a
+    /// ``SudachiError/DictionaryLoadError(message:)`` that says so; check a
+    /// file with ``dictionaryFormat(path:)``.
+    ///
+    /// **iOS / app bundle:** download a zip from
+    /// ``SudachiDictDistribution/downloadURL(version:)`` on your dev machine,
     /// extract the `.dic`, drag it into your Xcode target's *Copy Bundle
     /// Resources* build phase, and read it via `Bundle.main.url(forResource:)`.
     ///
@@ -93,7 +98,8 @@ extension Tokenizer {
     /// - Parameters:
     ///   - dictionaryPath: Absolute path to a system `.dic` file.
     ///   - userDictionaryPaths: Optional user dictionaries, applied in order
-    ///     (mirrors `userDict` in `sudachi.json`).
+    ///     (mirrors `userDict` in `sudachi.json`). Each must be built (V1) against
+    ///     the exact system dictionary passed in `dictionaryPath`.
     public static func create(
         dictionaryPath: String,
         userDictionaryPaths: [String] = []
@@ -114,7 +120,8 @@ extension Tokenizer {
 ///
 /// `.core` is the recommended default. Each case knows its approximate
 /// ``sizeMB``, conventional ``dicFilename`` inside the zip, and
-/// ``downloadURL(version:)`` for fetching the archive.
+/// ``downloadURL(version:)`` for fetching the V1-format archive this version
+/// of SudachiSwift can load.
 ///
 /// This type doesn't perform any I/O — the analyzer is decoupled from
 /// dictionary distribution so you can ship a `.dic` inside your app bundle,
@@ -123,7 +130,7 @@ extension Tokenizer {
 ///
 /// ```swift
 /// // Decide what you need
-/// let dist: SudachiDictDistribution = .core   // ~70 MB
+/// let dist: SudachiDictDistribution = .core   // ~77 MB
 /// let zipURL = dist.downloadURL()
 ///
 /// // ...download with URLSession, extract with a zip library...
@@ -138,13 +145,13 @@ public enum SudachiDictDistribution: String, CaseIterable, CustomStringConvertib
 
     public var description: String { rawValue.capitalized }
 
-    /// Approximate compressed archive size, in megabytes. Useful for budgeting
-    /// downloads / UX progress.
+    /// Approximate compressed archive size, in megabytes (V1 zips of the
+    /// 20260723 release). Useful for budgeting downloads / UX progress.
     public var sizeMB: Int {
         switch self {
-        case .small: return 50
-        case .core: return 70
-        case .full: return 1000
+        case .small: return 42
+        case .core: return 77
+        case .full: return 137
         }
     }
 
@@ -152,12 +159,13 @@ public enum SudachiDictDistribution: String, CaseIterable, CustomStringConvertib
     /// (e.g. `"system_core.dic"`).
     public var dicFilename: String { "system_\(rawValue).dic" }
 
-    /// URL of the `sudachi-dictionary-{version}-{distribution}.zip` archive on
-    /// SudachiDict's CDN. Pass a specific version like `"20241021"` to pin, or
-    /// leave `nil` for the latest published release.
+    /// URL of the V1-format `sudachi-dictionary-{version}-{distribution}.zip`
+    /// archive on SudachiDict's CDN. Pass a specific version like `"20260723"`
+    /// to pin, or leave `nil` for the latest published release. V1 builds
+    /// exist from `20260723` onwards; older versions are V0 only.
     public func downloadURL(version: String? = nil) -> URL {
         let v = version ?? "latest"
-        let host = "https://d2ej7fkh96fzlu.cloudfront.net/sudachidict"
+        let host = "https://d2ej7fkh96fzlu.cloudfront.net/sudachidict/v1"
         return URL(string: "\(host)/sudachi-dictionary-\(v)-\(rawValue).zip")!
     }
 }
@@ -196,12 +204,14 @@ public enum SudachiDictionaryStore {
         directory.appendingPathComponent("system_\(distribution.rawValue).dic")
     }
 
-    /// `true` if a `.dic` for `distribution` exists at the conventional path.
+    /// `true` if a loadable (V1-format) `.dic` for `distribution` exists at
+    /// the conventional path. A V0 dictionary left over from SudachiSwift 0.6
+    /// reports `false`, so a "download if not installed" flow replaces it.
     public static func isInstalled(
         _ distribution: SudachiDictDistribution,
         in directory: URL = defaultDirectory
     ) -> Bool {
-        FileManager.default.fileExists(atPath: dictionaryPath(for: distribution, in: directory).path)
+        dictionaryFormat(path: dictionaryPath(for: distribution, in: directory).path) == .v1
     }
 
     /// Look for a `.dic` to load. Searches the caller-supplied paths first,
@@ -228,11 +238,12 @@ public enum SudachiDictionaryStore {
 
     /// Build a tokenizer from the first `.dic` ``findDictionary(in:)`` locates.
     /// Throws ``SudachiError/DictionaryLoadError(message:)`` with an
-    /// actionable hint when no dictionary is installed.
+    /// actionable hint when no dictionary is installed, or when the one found
+    /// is a legacy V0 dictionary.
     public static func createTokenizer() throws -> Tokenizer {
         guard let path = findDictionary() else {
             throw SudachiError.DictionaryLoadError(
-                message: "No .dic file found. Place one at \(defaultDirectory.path) or bundle it with your app."
+                message: "No .dic file found. Place a V1 dictionary (see SudachiDictDistribution.downloadURL()) at \(defaultDirectory.path) or bundle it with your app."
             )
         }
         return try Tokenizer.create(dictionaryPath: path.path)

@@ -1,6 +1,6 @@
 [package]
 name = "sudachi-swift"
-version = "0.6.11"
+version = "0.7.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Swift bindings for sudachi.rs Japanese morphological analyzer"
@@ -15,7 +15,9 @@ name = "sudachi_swift"
 # Apple platforms support landed upstream in v0.6.11 (PR #308), so we now track
 # the official WorksApplications/sudachi.rs releases directly.
 sudachi = { path = "../sudachi.rs/sudachi" }
-uniffi = "0.30"
+# Must match the uniffi_bindgen bundled in the cargo-swift version pinned in
+# scripts/build-local.sh (cargo-swift 0.11.1 bundles uniffi_bindgen =0.31.1).
+uniffi = "=0.31.1"
 thiserror = "2"
 
 [profile.release]
