@@ -46,19 +46,35 @@ struct ContentView: View {
     }
 
     func checkDictionary() {
-        if FileManager.default.fileExists(atPath: getDictionaryPath()) {
-            dictionaryStatus = "Ready"
-        } else {
+        let path = getDictionaryPath()
+        guard FileManager.default.fileExists(atPath: path) else {
             dictionaryStatus = "Not found"
             result = """
             Dictionary not found.
 
             To use this demo:
-            1. Download a dictionary from:
+            1. Download a V1 dictionary from:
                \(SudachiDictDistribution.small.downloadURL())
-            2. Extract the .dic file
+            2. Extract \(SudachiDictDistribution.small.dicFilename) from the zip
             3. Copy it to the app's Documents folder as "system.dic"
             """
+            return
+        }
+
+        switch dictionaryFormat(path: path) {
+        case .v1:
+            dictionaryStatus = "Ready"
+        case .legacyV0:
+            dictionaryStatus = "Legacy V0"
+            result = """
+            system.dic is a legacy V0 dictionary, which SudachiSwift 0.7+ can't load.
+
+            Replace it with a V1 dictionary from:
+               \(SudachiDictDistribution.small.downloadURL())
+            """
+        case .unknown:
+            dictionaryStatus = "Unreadable"
+            result = "system.dic is not a readable Sudachi dictionary."
         }
     }
 
