@@ -11,6 +11,14 @@ on:
 permissions:
   contents: write
 
+# One release at a time: a later dispatch waits for the running one instead
+# of racing its pushes (GitHub keeps only the newest pending dispatch), and a
+# second dispatch of the same version is then stopped by the tag check in the
+# validate step.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     # Same image as build.yml; macos-14 is being retired
@@ -23,16 +31,44 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Validate version format
+      - name: Validate version, branch and tag
+        # Everything here is known before the ~20 minute build, so fail fast.
         env:
           # Passed via env so the raw input is never spliced into the script.
           VERSION_INPUT: ${{ github.event.inputs.version }}
         run: |
           VERSION="$VERSION_INPUT"
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Version must be in format X.Y.Z (e.g., 0.7.0)"
+            echo "::error::Version must be in format X.Y.Z (e.g., 0.7.0), got '$VERSION'"
             exit 1
           fi
+
+          # getVersion() reports the crate version, so the tag must match it.
+          # (Only the [package] section; a dependency table can have its own
+          # `version = ` line.)
+          CARGO_VERSION=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' rust/Cargo.toml)
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error file=rust/Cargo.toml::Input version $VERSION does not match rust/Cargo.toml version '$CARGO_VERSION'"
+            exit 1
+          fi
+
+          # The stable push fast-forwards main (see "Commit and tag stable
+          # release"), so the release commit must be built from main.
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Dispatch Release from main (got $GITHUB_REF)"
+            exit 1
+          fi
+
+          # A re-run for a version that is already tagged would fail at
+          # `git tag` after the build; a published tag is never moved.
+          for TAG in "v$VERSION" "v$VERSION-nightly"; do
+            REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/$TAG")
+            if [ -n "$REMOTE_TAG" ] || git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              echo "::error::Tag $TAG already exists; bump rust/Cargo.toml for a new release, or see the recovery notes in release.yml if v$VERSION's release is incomplete"
+              exit 1
+            fi
+          done
+
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Releasing version: $VERSION"
 
@@ -63,10 +99,11 @@ jobs:
           fi
           cargo +stable install cargo-swift --version "$CARGO_SWIFT_VERSION" --locked
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
+      # No Swatinem/rust-cache here: caches on the default branch can be written
+      # by jobs that run unreviewed build scripts (check-upstream's probe), and
+      # this job publishes binaries, so it always builds from a clean target dir.
+      - name: Check rust/Cargo.lock is up to date
+        run: cargo +stable metadata --locked --format-version 1 --manifest-path rust/Cargo.toml > /dev/null
 
       # ===========================================
       # Build Stable (iOS + macOS)
@@ -92,6 +129,30 @@ jobs:
           echo "STABLE_CHECKSUM=$CHECKSUM" >> "$GITHUB_ENV"
           echo "Stable checksum: $CHECKSUM"
 
+      # The tag pushed below pins this zip's checksum in Package.swift, and a
+      # rebuild can't reproduce it (zip records file mtimes), so keep the exact
+      # bytes before anything is pushed.
+      #
+      # Recovery if a later step fails after the tag push (for example the
+      # GitHub Release step), leaving vX.Y.Z tagged without its asset. Don't
+      # re-run this workflow: the validate step refuses an existing tag, and a
+      # new build would not match the tagged checksum. Instead:
+      #   gh run download <run-id> -n release-vX.Y.Z-stable
+      #   swift package compute-checksum SudachiSwift.xcframework.zip
+      #     (must equal `let checksum` in Package.swift at tag vX.Y.Z)
+      #   gh release create vX.Y.Z SudachiSwift.xcframework.zip --verify-tag --generate-notes
+      #     (or `gh release upload vX.Y.Z SudachiSwift.xcframework.zip` if the
+      #     release exists but has no asset)
+      # The nightly zip below is kept the same way (see its recovery note).
+      - name: Keep stable zip for recovery
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-v${{ env.VERSION }}-stable
+          path: SudachiSwift.xcframework.zip
+          if-no-files-found: error
+          # Already a zip.
+          compression-level: 0
+
       # ===========================================
       # Publish stable: tag, then the GitHub Release right away, so the
       # binaryTarget URL in the tagged Package.swift resolves before the
@@ -115,11 +176,15 @@ jobs:
                   Sources/SudachiSwift/sudachi_swift.swift
           git commit -m "chore: release v$VERSION"
           git tag "v$VERSION"
-          git push origin main --tags
+          # Atomic: if main moved since checkout, neither main nor the tag is
+          # updated (a plain `git push origin main --tags` would still push the
+          # tag while main is rejected).
+          git push --atomic origin HEAD:main "refs/tags/v$VERSION"
 
       - name: Create stable GitHub Release
-        # The body recommends `exact:` because upstream says 0.7.x may change
-        # behavior even in patch releases; revisit once sudachi.rs reaches 1.0.
+        # The body recommends `exact:` because upstream sudachi.rs 0.x releases
+        # may change behavior even in patch releases; revisit once sudachi.rs
+        # reaches 1.0.
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ env.VERSION }}
@@ -136,7 +201,7 @@ jobs:
             ```swift
             .package(url: "https://github.com/${{ github.repository }}", exact: "${{ env.VERSION }}")
             ```
-            Pin the exact version: sudachi.rs 0.7.x may change tokenization behavior even in patch releases.
+            Pin the exact version: upstream sudachi.rs 0.x releases may change tokenization behavior even in patch releases.
 
             **Dictionary:** a V1-format SudachiDict dictionary is required; legacy V0 dictionaries are rejected. See [Dictionary Setup](https://github.com/${{ github.repository }}/blob/v${{ env.VERSION }}/README.md#dictionary-setup), and [Upgrading from 0.6.x](https://github.com/${{ github.repository }}/blob/v${{ env.VERSION }}/README.md#upgrading-from-06x) if you are coming from 0.6.
 
@@ -168,6 +233,22 @@ jobs:
           echo "NIGHTLY_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "Nightly checksum: $CHECKSUM"
 
+      # Same reason as "Keep stable zip for recovery". If the nightly tag was
+      # pushed but its prerelease step failed:
+      #   gh run download <run-id> -n release-vX.Y.Z-nightly
+      #   swift package compute-checksum SudachiSwift-nightly.xcframework.zip
+      #     (must equal `let checksum` in Package.swift at tag vX.Y.Z-nightly)
+      #   gh release create vX.Y.Z-nightly SudachiSwift-nightly.xcframework.zip \
+      #     --verify-tag --prerelease --latest=false
+      - name: Keep nightly zip for recovery
+        if: env.NIGHTLY_AVAILABLE == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-v${{ env.VERSION }}-nightly
+          path: SudachiSwift-nightly.xcframework.zip
+          if-no-files-found: error
+          compression-level: 0
+
       - name: Mark nightly as unavailable
         if: steps.nightly-build.outcome != 'success'
         run: |
@@ -175,6 +256,9 @@ jobs:
           echo "Nightly build failed, skipping nightly release"
 
       - name: Restore stable artifacts from snapshot
+        # Puts the stable build's generated bindings back, so the nightly tag
+        # differs from the stable release commit only in Package.swift (the
+        # "Same sources as vX.Y.Z" in the prerelease notes).
         if: env.NIGHTLY_AVAILABLE == 'true'
         run: |
           rm -rf SudachiSwift.xcframework
@@ -195,17 +279,23 @@ jobs:
           head -20 Package.swift
 
       - name: Commit and tag nightly release
+        # The nightly commit lives only on its tag: it is committed on a
+        # detached HEAD (child of the stable release commit) and only the tag
+        # is pushed. main stays on the stable release commit, so there is no
+        # "restore Package.swift" commit, and commits that land on main during
+        # the nightly build can't make this push fail halfway.
         if: env.NIGHTLY_AVAILABLE == 'true'
         run: |
+          git checkout --detach
           git add Package.swift Sources/SudachiSwift/sudachi_swift.swift
           git commit -m "chore: release v$VERSION-nightly"
           git tag "v$VERSION-nightly"
-          git push origin main --tags
+          git push origin "refs/tags/v$VERSION-nightly"
 
       - name: Create nightly GitHub prerelease
         # The nightly tag's Package.swift downloads
         # releases/download/v<version>-nightly/SudachiSwift-nightly.xcframework.zip,
-        # so the asset must live on a release for that tag.
+        # so the asset must live on a release for that tag (pushed above).
         if: env.NIGHTLY_AVAILABLE == 'true'
         uses: softprops/action-gh-release@v3
         with:
@@ -229,17 +319,3 @@ jobs:
 
             ### Checksum
             - Nightly: `${{ env.NIGHTLY_CHECKSUM }}`
-
-      # ===========================================
-      # Restore Package.swift to stable (keep main stable)
-      # ===========================================
-      - name: Restore Package.swift to stable
-        if: env.NIGHTLY_AVAILABLE == 'true'
-        run: |
-          sed -i '' "s/let version = \".*\"/let version = \"$VERSION\"/" Package.swift
-          sed -i '' "s/let checksum = \".*\"/let checksum = \"$STABLE_CHECKSUM\"/" Package.swift
-          sed -i '' "s/SudachiSwift-nightly.xcframework.zip/SudachiSwift.xcframework.zip/" Package.swift
-
-          git add Package.swift
-          git commit -m "chore: restore Package.swift to stable after nightly tag"
-          git push origin main
