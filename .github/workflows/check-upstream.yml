@@ -1,81 +1,297 @@
+# For each sudachi.rs release newer than the pinned submodule tag, once: an issue assigned to
+# the repo owner (closing it skips the release; once it exists, open or closed, the release is
+# never touched again, so manual commits on the bump branch are never overwritten) and a bump
+# PR (draft if breaking or rust/ stops compiling). Also warns before GitHub auto-disables this
+# schedule (60 idle days) and opens an issue when this workflow fails.
+# Optional secret UPSTREAM_BOT_TOKEN (fine-grained PAT, this repo, Contents + Pull requests
+# read/write) lets the bump PR run build.yml normally; otherwise build.yml is dispatched.
 name: Check Upstream Updates
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '17 1 * * *' # daily, off the top of the hour (runs at :00 get delayed/dropped)
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: compute and print everything, create/modify nothing'
+        type: boolean
+        default: false
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
+
+concurrency:
+  group: check-upstream
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UPSTREAM: WorksApplications/sudachi.rs
+  GH_REPO: ${{ github.repository }} # every gh call in every job targets this repo
+  DRY_RUN: ${{ inputs.dry_run == true }}
+  OWNER: ${{ github.repository_owner }}
 
 jobs:
-  check-upstream:
+  check:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
+    permissions:
+      contents: write      # push the bump branch
+      pull-requests: write # open / comment on the bump PR
+      issues: write        # labels + tracking issue
+      actions: write       # dispatch build.yml on the bump branch
+    env:
+      HAS_BOT_TOKEN: ${{ secrets.UPSTREAM_BOT_TOKEN != '' }}
+    # Steps share state via $GITHUB_ENV; upstream tags are validated (^v\d+\.\d+\.\d+$) first and
+    # never interpolated into script text. GH_TOKEN is per step: `cargo check` never sees it.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
+          persist-credentials: false # no token in .git/config; create-pull-request brings its own
 
-      - name: Resolve latest upstream tag
-        id: check
+      - name: Detect new upstream release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          LATEST=$(gh api repos/WorksApplications/sudachi.rs/releases/latest --jq '.tag_name')
-          echo "Latest upstream release: $LATEST"
-
-          CURRENT_SHA=$(git -C sudachi.rs rev-parse HEAD)
-          LATEST_SHA=$(git -C sudachi.rs rev-parse "refs/tags/${LATEST}" 2>/dev/null || true)
-
-          if [ -z "$LATEST_SHA" ]; then
-            git -C sudachi.rs fetch origin --tags
-            LATEST_SHA=$(git -C sudachi.rs rev-parse "refs/tags/${LATEST}")
+          set -euo pipefail
+          gh api "repos/$UPSTREAM/releases/latest" > "$RUNNER_TEMP/release.json"
+          LATEST=$(jq -r '.tag_name' "$RUNNER_TEMP/release.json")
+          jq -r '.body // ""' "$RUNNER_TEMP/release.json" > "$RUNNER_TEMP/release-body.md"
+          git -C sudachi.rs fetch --quiet --force --tags origin # after the API call: $LATEST's tag is fetched
+          if ! PINNED=$(git -C sudachi.rs describe --tags --exact-match --match 'v[0-9]*' HEAD); then
+            echo "::error::sudachi.rs submodule HEAD ($(git -C sudachi.rs rev-parse --short HEAD)) is not exactly on a release tag"
+            exit 1
           fi
-
-          CURRENT_VERSION=$(grep '^version' rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          LATEST_VERSION=${LATEST#v}
-
-          echo "Pinned submodule SHA: $CURRENT_SHA"
-          echo "Latest tag SHA: $LATEST_SHA"
-          echo "Wrapper Cargo.toml version: $CURRENT_VERSION"
-
-          echo "latest=$LATEST" >> $GITHUB_OUTPUT
-          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
-          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-
-          if [ "$CURRENT_SHA" != "$LATEST_SHA" ] || [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
-            echo "needs_update=true" >> $GITHUB_OUTPUT
-          else
-            echo "needs_update=false" >> $GITHUB_OUTPUT
+          SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          for t in "$PINNED" "$LATEST"; do
+            if ! [[ $t =~ $SEMVER ]]; then echo "::error::Unexpected tag format: '$t'"; exit 1; fi
+          done
+          PV=${PINNED#v} LV=${LATEST#v}
+          echo "Pinned submodule tag: $PINNED; latest upstream release: $LATEST"
+          if [ "$PV" = "$LV" ] || [ "$(printf '%s\n%s\n' "$PV" "$LV" | sort -V | tail -n 1)" != "$LV" ]; then
+            echo "Nothing newer upstream than $PINNED." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
+          IFS=. read -r PMAJ PMIN _ <<< "$PV"; IFS=. read -r LMAJ LMIN _ <<< "$LV"
+          KIND="patch"
+          if [ "$PMAJ" != "$LMAJ" ] || { [ "$LMAJ" = 0 ] && [ "$PMIN" != "$LMIN" ]; }; then KIND="breaking"; fi
+          CAUTION=false
+          if grep -qiE 'breaking|caution|migration|dictionary (binary )?format' "$RUNNER_TEMP/release-body.md"; then CAUTION=true; fi
+          TITLE="sudachi.rs $LATEST released" BRANCH="automation/sudachi-rs-$LATEST"
+          echo "New upstream release $LATEST (pinned $PINNED): kind=$KIND caution=$CAUTION" | tee -a "$GITHUB_STEP_SUMMARY"
+          FOUND=$(gh issue list --state all --label upstream-update --limit 200 --json number,title,state \
+            | jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | if . == null then "" else "#\(.number) (\(.state))" end')
+          if [ -n "$FOUND" ]; then
+            echo "Tracking issue $FOUND exists: nothing to do (closed = skipped)." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          REFS=$(gh api "repos/$GH_REPO/git/matching-refs/heads/$BRANCH" | jq --arg r "refs/heads/$BRANCH" 'map(select(.ref == $r)) | length')
+          BRANCH_EXISTS=false
+          if [ "$REFS" -gt 0 ]; then BRANCH_EXISTS=true; fi
+          echo "No issue titled '$TITLE' yet; branch $BRANCH exists: $BRANCH_EXISTS"
+          printf '%s\n' NEW_RELEASE=true "PINNED=$PINNED" "LATEST=$LATEST" "VERSION=$LV" "KIND=$KIND" \
+            "CAUTION=$CAUTION" "TITLE=$TITLE" "BRANCH=$BRANCH" "BRANCH_EXISTS=$BRANCH_EXISTS" >> "$GITHUB_ENV"
 
-      - name: Bump submodule to latest upstream tag
-        if: steps.check.outputs.needs_update == 'true'
+      - if: env.NEW_RELEASE == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump submodule, version and resources; cargo check
+        if: env.NEW_RELEASE == 'true'
         run: |
-          git -C sudachi.rs fetch origin --tags
-          git -C sudachi.rs checkout "${{ steps.check.outputs.latest }}"
+          set -euo pipefail
+          git -C sudachi.rs -c advice.detachedHead=false checkout --quiet "refs/tags/$LATEST"
+          # shellcheck disable=SC2016 # $ENV{VERSION} is Perl; the first `version =` line is [package]'s
+          perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' rust/Cargo.toml
+          grep -q "^version = \"$VERSION\"\$" rust/Cargo.toml
+          MISSING=""
+          for f in char.def unk.def rewrite.def sudachi.json; do
+            cp "sudachi.rs/resources/$f" Sources/SudachiSwift/Resources/ || MISSING="$MISSING $f"
+          done
+          git status --short
+          set +e
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target" cargo check --quiet --message-format short \
+            --manifest-path rust/Cargo.toml 2>&1 | tee "$RUNNER_TEMP/cargo.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+          # Excerpt for the issue: last 60 lines without upstream's own (path dependency) warnings.
+          grep -v '/sudachi\.rs/.*: warning: ' "$RUNNER_TEMP/cargo.log" | tail -n 60 > "$RUNNER_TEMP/cargo-tail.log" || true
+          COMPILE=fail
+          if [ "$RC" -eq 0 ]; then COMPILE=pass; fi
+          echo "cargo check: $COMPILE (exit $RC)" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "COMPILE=$COMPILE" "MISSING=${MISSING# }" >> "$GITHUB_ENV"
 
-          # Sync wrapper Cargo.toml version to upstream
-          sed -i "s/^version = \".*\"/version = \"${{ steps.check.outputs.latest_version }}\"/" rust/Cargo.toml
+      - name: Open tracking issue
+        if: env.NEW_RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          U="https://github.com/$UPSTREAM"
+          LABELS=upstream-update DRAFT=false
+          if [ "$KIND" = breaking ]; then LABELS+=",upstream:breaking" DRAFT=true; fi
+          if [ "$COMPILE" = fail ]; then LABELS+=",upstream:compile-fail" DRAFT=true; fi
+          {
+            echo "Upstream sudachi.rs released **$LATEST**: $U/releases/tag/$LATEST"
+            echo
+            echo "- Pinned → latest: \`$PINNED\` → \`$LATEST\` ([diff]($U/compare/$PINNED...$LATEST))"
+            echo "- Classification: **$KIND** (breaking = major bump, or minor bump while major is 0)"
+            echo "- Release notes mention breaking / caution / migration / dictionary format: **$CAUTION**"
+            echo "- \`cargo check\` of \`rust/\` against $LATEST: **$COMPILE**"
+            if [ -n "$MISSING" ]; then echo "- Bundled resources not found upstream (not refreshed): $MISSING"; fi
+            if [ "$COMPILE" = fail ]; then
+              printf '\n<details><summary>cargo check output (last 60 lines, upstream warnings omitted)</summary>\n\n```text\n'
+              cat "$RUNNER_TEMP/cargo-tail.log"
+              printf '```\n\n</details>\n'
+            fi
+            echo
+            if [ "$KIND" = breaking ] || [ "$CAUTION" = true ]; then
+              echo "### Migration checklist"
+              echo "- [ ] Read the release notes, [migration guide]($U/blob/$LATEST/docs/migration_guide.md) and [CHANGELOG]($U/blob/$LATEST/CHANGELOG.md)"
+              echo "- [ ] Fix \`rust/src/lib.rs\` until \`cargo check --manifest-path rust/Cargo.toml\` passes"
+              echo "- [ ] Check bundled resources and whether the dictionary format changed (download URLs, CI test dictionary)"
+              echo "- [ ] Update README / docs (API changes, recommended SPM version requirement, notes for users)"
+              echo "- [ ] Merge, then run the **Release** workflow with version \`$VERSION\`"
+            else
+              echo "Review the bump PR and its CI, merge, then run the **Release** workflow with version \`$VERSION\`."
+            fi
+            echo
+            if [ "$BRANCH_EXISTS" = true ]; then echo "Branch \`$BRANCH\` already exists, so no PR was opened (it is never overwritten)."; echo; fi
+            echo "**Close this issue to skip this release**: the workflow never touches $LATEST again once this issue exists."
+          } > "$RUNNER_TEMP/issue.md"
+          if [ "$DRY_RUN" = true ]; then
+            echo "[dry run] would create issue '$TITLE' (labels $LABELS; assignee $OWNER):"; cat "$RUNNER_TEMP/issue.md"
+            ISSUE=""
+          else
+            gh label create upstream-update --force --color 0E8A16 --description "New upstream sudachi.rs release"
+            gh label create upstream:breaking --force --color B60205 --description "Upstream release needs a manual migration"
+            gh label create upstream:compile-fail --force --color D93F0B --description "rust/ does not compile against this upstream release"
+            gh label create workflow-health --force --color FBCA04 --description "Automation needs the maintainer's attention"
+            URL=$(gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/issue.md" --label "$LABELS" --assignee "$OWNER")
+            ISSUE=${URL##*/}
+            echo "Tracking issue: $URL" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '%s\n\n%s\n\nCloses #%s\n' \
+            "Bumps \`sudachi.rs\` \`$PINNED\` → \`$LATEST\`, \`rust/Cargo.toml\` version → \`$VERSION\`, and refreshes \`Sources/SudachiSwift/Resources/\` from \`sudachi.rs/resources/\`. Kind **$KIND**, release-notes caution **$CAUTION**, cargo check **$COMPILE** (details in #${ISSUE:-new})." \
+            "Mechanical bump only: push migration commits to this branch; the workflow never touches it again." \
+            "${ISSUE:-new}" > "$RUNNER_TEMP/pr.md"
+          if [ "$DRY_RUN" = true ]; then echo "[dry run] would open PR from $BRANCH unless it exists ($BRANCH_EXISTS); draft $DRAFT:"; cat "$RUNNER_TEMP/pr.md"; fi
+          printf '%s\n' "ISSUE=$ISSUE" "LABELS=$LABELS" "DRAFT=$DRAFT" >> "$GITHUB_ENV"
 
-      - name: Open PR with submodule bump
-        if: steps.check.outputs.needs_update == 'true'
-        uses: peter-evans/create-pull-request@v6
+      - name: Open bump PR
+        id: cpr
+        if: env.NEW_RELEASE == 'true' && env.BRANCH_EXISTS == 'false' && env.DRY_RUN != 'true'
+        continue-on-error: true
+        uses: peter-evans/create-pull-request@v8
         with:
-          branch: chore/bump-sudachi-${{ steps.check.outputs.latest_version }}
-          commit-message: "chore: bump sudachi.rs to ${{ steps.check.outputs.latest }}"
-          title: "chore: bump sudachi.rs to ${{ steps.check.outputs.latest }}"
-          labels: upstream-update
-          body: |
-            Upstream sudachi.rs released **${{ steps.check.outputs.latest }}**.
+          token: ${{ secrets.UPSTREAM_BOT_TOKEN || github.token }}
+          branch: ${{ env.BRANCH }}
+          commit-message: 'chore: bump sudachi.rs to ${{ env.LATEST }}'
+          title: 'chore: bump sudachi.rs to ${{ env.LATEST }}'
+          body-path: ${{ runner.temp }}/pr.md
+          labels: ${{ env.LABELS }}
+          assignees: ${{ github.repository_owner }}
+          draft: ${{ env.DRAFT }}
+          add-paths: |
+            sudachi.rs
+            rust/Cargo.toml
+            Sources/SudachiSwift/Resources
 
-            - Bumps the `sudachi.rs` submodule to tag `${{ steps.check.outputs.latest }}`
-            - Syncs `rust/Cargo.toml` version `${{ steps.check.outputs.current_version }}` → `${{ steps.check.outputs.latest_version }}`
+      - name: Report PR result / dispatch CI
+        if: env.NEW_RELEASE == 'true' && env.BRANCH_EXISTS == 'false' && env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_OUTCOME: ${{ steps.cpr.outcome }}
+          PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+          BASE: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ENC_BRANCH=${BRANCH//\//%2F}
+          if [ "$PR_OUTCOME" != success ] || [ -z "$PR_NUMBER" ]; then
+            printf '%s\n\n%s\n%s\n' "The bump PR could not be opened automatically (run: $RUN_URL)." \
+              "- If branch \`$BRANCH\` was pushed, open the PR by hand: https://github.com/$GH_REPO/compare/$BASE...$ENC_BRANCH" \
+              "- One-time fix: Settings → Actions → General → Workflow permissions → enable **Allow GitHub Actions to create and approve pull requests**, or add an \`UPSTREAM_BOT_TOKEN\` secret (fine-grained PAT, Contents + Pull requests: read/write)." \
+              > "$RUNNER_TEMP/comment.md"
+            gh issue comment "$ISSUE" --body-file "$RUNNER_TEMP/comment.md"
+            exit 0
+          fi
+          echo "Bump PR: $PR_URL" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$HAS_BOT_TOKEN" = true ]; then echo "Opened with UPSTREAM_BOT_TOKEN: build.yml runs via pull_request."; exit 0; fi
+          NOTE="Opened with \`GITHUB_TOKEN\`, so this PR's \`pull_request\` CI runs wait for approval."
+          if RUN=$(gh workflow run build.yml --ref "$BRANCH" 2> "$RUNNER_TEMP/dispatch.err"); then
+            MSG="$NOTE Dispatched **build.yml** on \`$BRANCH\` instead: ${RUN:-https://github.com/$GH_REPO/actions/workflows/build.yml?query=branch%3A$ENC_BRANCH}"
+          else
+            cat "$RUNNER_TEMP/dispatch.err"
+            MSG="$NOTE Dispatching build.yml on \`$BRANCH\` failed ($(tail -n 1 "$RUNNER_TEMP/dispatch.err")): approve the pending runs in the Checks tab, or run build.yml on this branch by hand (it needs a \`workflow_dispatch:\` trigger)."
+          fi
+          gh pr comment "$PR_NUMBER" --body "$MSG"
 
-            If CI passes, merging this and triggering the `Release` workflow will publish
-            `v${{ steps.check.outputs.latest_version }}` of SudachiSwift.
+  inactivity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Warn before GitHub disables this schedule
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WARN_DAYS: 45
+        run: |
+          set -euo pipefail
+          BRANCH=$(gh api "repos/$GH_REPO" --jq .default_branch)
+          LAST=$(gh api "repos/$GH_REPO/commits/$BRANCH" --jq .commit.committer.date)
+          LAST_TS=$(jq -rn --arg d "$LAST" '$d | fromdateiso8601')
+          DAYS=$(( ($(date -u +%s) - LAST_TS) / 86400 ))
+          LAST_DAY=$(jq -rn --argjson t "$LAST_TS" '$t | strftime("%Y-%m-%d")')
+          OFF_DAY=$(jq -rn --argjson t "$LAST_TS" '$t + 60 * 86400 | strftime("%Y-%m-%d")')
+          echo "Last commit on $BRANCH: $LAST ($DAYS days ago); GitHub would disable this schedule around $OFF_DAY."
+          PREFIX="Scheduled upstream check needs activity"
+          ISSUES=$(gh issue list --state all --label workflow-health --limit 200 --json number,title,state)
+          if [ "$DAYS" -lt "$WARN_DAYS" ]; then
+            for N in $(jq -r --arg p "$PREFIX" '.[] | select(.state == "OPEN" and (.title | startswith($p))) | .number' <<< "$ISSUES"); do
+              if [ "$DRY_RUN" = true ]; then echo "[dry run] would close #$N"; continue; fi
+              gh issue close "$N" --comment "Resolved: the last commit on \`$BRANCH\` is from $LAST_DAY ($DAYS days ago)."
+            done
+            exit 0
+          fi
+          TITLE="$PREFIX (last push $LAST_DAY)"
+          N=$(jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | .number // empty' <<< "$ISSUES")
+          if [ -n "$N" ]; then echo "Warning issue #$N already exists."; exit 0; fi
+          printf '%s\n\n%s\n\n%s\n%s\n' "No commit has landed on \`$BRANCH\` since **$LAST_DAY** ($DAYS days ago)." \
+            "GitHub disables scheduled workflows in public repositories after 60 days without repository activity (this workflow's own runs do not count): expected around **$OFF_DAY**. After that new sudachi.rs releases are not detected and nobody is notified." \
+            "- Keep it alive: push any commit to \`$BRANCH\`. This issue then closes itself on the next run." \
+            "- Already disabled: Actions tab → **Check Upstream Updates** → **Enable workflow**, or \`gh workflow enable check-upstream.yml\`." \
+            > "$RUNNER_TEMP/inactive.md"
+          if [ "$DRY_RUN" = true ]; then
+            echo "[dry run] would create issue '$TITLE' (label workflow-health; assignee $OWNER):"; cat "$RUNNER_TEMP/inactive.md"; exit 0
+          fi
+          gh label create workflow-health --force --color FBCA04 --description "Automation needs the maintainer's attention"
+          gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/inactive.md" --label workflow-health --assignee "$OWNER"
 
-            Release notes: https://github.com/WorksApplications/sudachi.rs/releases/tag/${{ steps.check.outputs.latest }}
+  alert:
+    needs: [check, inactivity]
+    if: failure() && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE="check-upstream workflow is failing"
+          gh label create workflow-health --force --color FBCA04 --description "Automation needs the maintainer's attention"
+          N=$(gh issue list --state open --label workflow-health --limit 200 --json number,title \
+            | jq -r --arg t "$TITLE" 'map(select(.title == $t)) | first | .number // empty')
+          if [ -n "$N" ]; then gh issue comment "$N" --body "Failed again: $RUN_URL"; exit 0; fi
+          gh issue create --title "$TITLE" --label workflow-health --assignee "$OWNER" --body \
+            "The scheduled upstream check failed: $RUN_URL. New sudachi.rs releases may go unnoticed until it is fixed. Later failures are added here as comments; close this issue once fixed."
