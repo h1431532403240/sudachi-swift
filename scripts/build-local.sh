@@ -23,6 +23,17 @@ PROFILE="${PROFILE:-release}"
 PLATFORMS="${PLATFORMS:-macos ios}"
 NIGHTLY="${NIGHTLY:-0}"
 
+# cargo-swift bundles its own uniffi_bindgen, which must match the `uniffi`
+# version pinned in rust/Cargo.toml (0.11.1 bundles uniffi_bindgen =0.31.1).
+# CI installs the version read from this line.
+CARGO_SWIFT_VERSION="0.11.1"
+installed_cargo_swift="$(cargo swift --version 2>/dev/null | awk '{print $2}' || true)"
+if [ "$installed_cargo_swift" != "$CARGO_SWIFT_VERSION" ]; then
+    echo "error: cargo-swift $CARGO_SWIFT_VERSION is required (found: ${installed_cargo_swift:-none})."
+    echo "  cargo install cargo-swift --version $CARGO_SWIFT_VERSION --locked"
+    exit 1
+fi
+
 # cargo-swift writes its self-contained Swift package into `<crate>/SudachiSwift/`.
 # We treat that directory as a build artifact and extract only the bits we need.
 CARGO_SWIFT_PKG="rust/SudachiSwift"

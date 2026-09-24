@@ -519,8 +519,12 @@ fileprivate struct FfiConverterString: FfiConverter {
 public protocol TokenizerProtocol: AnyObject, Sendable {
     
     /**
-     * Look up dictionary entries whose surface matches `query` exactly.
+     * Look up dictionary entries whose surface matches `query`.
      * Mirrors `Dictionary.lookup(surface)` in the Python binding.
+     *
+     * Since sudachi.rs 0.7 the query is first normalized by the dictionary's
+     * input-text plugins (e.g. full-width → half-width), so the returned
+     * `surface` and offsets refer to the normalized query, not `query`.
      */
     func lookup(query: String) throws  -> [MorphemeInfo]
     
@@ -619,8 +623,12 @@ public static func withDictionary(dictionaryPath: String)throws  -> Tokenizer  {
 
     
     /**
-     * Look up dictionary entries whose surface matches `query` exactly.
+     * Look up dictionary entries whose surface matches `query`.
      * Mirrors `Dictionary.lookup(surface)` in the Python binding.
+     *
+     * Since sudachi.rs 0.7 the query is first normalized by the dictionary's
+     * input-text plugins (e.g. full-width → half-width), so the returned
+     * `surface` and offsets refer to the normalized query, not `query`.
      */
 open func lookup(query: String)throws  -> [MorphemeInfo]  {
     return try  FfiConverterSequenceTypeMorphemeInfo.lift(try rustCallWithError(FfiConverterTypeSudachiError_lift) {
@@ -783,13 +791,14 @@ public struct MorphemeInfo: Equatable, Hashable {
      */
     public var partOfSpeechId: UInt32
     /**
-     * Dictionary ID (-1 for system, 0+ for user dicts, -1 for OOV / unknown)
+     * Dictionary ID (0 for the system dictionary, 1+ for user dictionaries
+     * in the order given, -1 for OOV)
      */
     public var dictionaryId: Int32
     /**
      * Synonym group IDs this morpheme belongs to
      */
-    public var synonymGroupIds: [UInt32]
+    public var synonymGroupIds: [Int32]
     /**
      * Start Unicode codepoint offset in the original text (matches Python's
      * `Morpheme.begin()`).
@@ -841,11 +850,12 @@ public struct MorphemeInfo: Equatable, Hashable {
          * Part-of-speech numeric ID
          */partOfSpeechId: UInt32, 
         /**
-         * Dictionary ID (-1 for system, 0+ for user dicts, -1 for OOV / unknown)
+         * Dictionary ID (0 for the system dictionary, 1+ for user dictionaries
+         * in the order given, -1 for OOV)
          */dictionaryId: Int32, 
         /**
          * Synonym group IDs this morpheme belongs to
-         */synonymGroupIds: [UInt32], 
+         */synonymGroupIds: [Int32], 
         /**
          * Start Unicode codepoint offset in the original text (matches Python's
          * `Morpheme.begin()`).
@@ -900,7 +910,7 @@ public struct FfiConverterTypeMorphemeInfo: FfiConverterRustBuffer {
                 end: FfiConverterUInt32.read(from: &buf), 
                 partOfSpeechId: FfiConverterUInt32.read(from: &buf), 
                 dictionaryId: FfiConverterInt32.read(from: &buf), 
-                synonymGroupIds: FfiConverterSequenceUInt32.read(from: &buf), 
+                synonymGroupIds: FfiConverterSequenceInt32.read(from: &buf), 
                 beginChar: FfiConverterUInt32.read(from: &buf), 
                 endChar: FfiConverterUInt32.read(from: &buf), 
                 totalCost: FfiConverterInt32.read(from: &buf)
@@ -919,7 +929,7 @@ public struct FfiConverterTypeMorphemeInfo: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.end, into: &buf)
         FfiConverterUInt32.write(value.partOfSpeechId, into: &buf)
         FfiConverterInt32.write(value.dictionaryId, into: &buf)
-        FfiConverterSequenceUInt32.write(value.synonymGroupIds, into: &buf)
+        FfiConverterSequenceInt32.write(value.synonymGroupIds, into: &buf)
         FfiConverterUInt32.write(value.beginChar, into: &buf)
         FfiConverterUInt32.write(value.endChar, into: &buf)
         FfiConverterInt32.write(value.totalCost, into: &buf)
@@ -1101,12 +1111,15 @@ public struct TokenizerConfig: Equatable, Hashable {
      */
     public var dictionaryPath: String
     /**
-     * Optional path to sudachi.json config file
+     * Optional path to sudachi.json config file. When omitted, the default
+     * config embedded in sudachi.rs is used.
      */
     public var configPath: String?
     /**
-     * Optional path to resource directory (where char.def, unk.def are located)
-     * If not provided, will use the parent directory of config_path or dictionary_path
+     * Optional resource directory (where char.def, unk.def, rewrite.def are
+     * located). Resources are resolved in sudachi.rs order: this directory,
+     * then the config's `path` field, then the config file's directory, then
+     * the defaults embedded in sudachi.rs.
      */
     public var resourcePath: String?
     /**
@@ -1122,11 +1135,14 @@ public struct TokenizerConfig: Equatable, Hashable {
          * Path to the system dictionary file (.dic)
          */dictionaryPath: String, 
         /**
-         * Optional path to sudachi.json config file
+         * Optional path to sudachi.json config file. When omitted, the default
+         * config embedded in sudachi.rs is used.
          */configPath: String?, 
         /**
-         * Optional path to resource directory (where char.def, unk.def are located)
-         * If not provided, will use the parent directory of config_path or dictionary_path
+         * Optional resource directory (where char.def, unk.def, rewrite.def are
+         * located). Resources are resolved in sudachi.rs order: this directory,
+         * then the config's `path` field, then the config file's directory, then
+         * the defaults embedded in sudachi.rs.
          */resourcePath: String?, 
         /**
          * User dictionary files, applied in order. Mirrors the `userDict` array
@@ -1183,6 +1199,94 @@ public func FfiConverterTypeTokenizerConfig_lift(_ buf: RustBuffer) throws -> To
 public func FfiConverterTypeTokenizerConfig_lower(_ value: TokenizerConfig) -> RustBuffer {
     return FfiConverterTypeTokenizerConfig.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Binary format of a Sudachi dictionary file.
+ */
+
+public enum DictionaryFormat: Equatable, Hashable {
+    
+    /**
+     * Binary format V1, the only format sudachi.rs 0.7+ can load.
+     */
+    case v1
+    /**
+     * Legacy format used by sudachi.rs 0.6 and earlier. Download a V1 build
+     * of the system dictionary and rebuild user dictionaries against it.
+     */
+    case legacyV0
+    /**
+     * Unreadable, not a Sudachi dictionary, or a format this version does
+     * not know.
+     */
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension DictionaryFormat: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDictionaryFormat: FfiConverterRustBuffer {
+    typealias SwiftType = DictionaryFormat
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DictionaryFormat {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .v1
+        
+        case 2: return .legacyV0
+        
+        case 3: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DictionaryFormat, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .v1:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .legacyV0:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDictionaryFormat_lift(_ buf: RustBuffer) throws -> DictionaryFormat {
+    return try FfiConverterTypeDictionaryFormat.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDictionaryFormat_lower(_ value: DictionaryFormat) -> RustBuffer {
+    return FfiConverterTypeDictionaryFormat.lower(value)
+}
+
 
 
 public enum SudachiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
@@ -1425,23 +1529,23 @@ fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
-    typealias SwiftType = [UInt32]
+fileprivate struct FfiConverterSequenceInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [Int32]
 
-    public static func write(_ value: [UInt32], into buf: inout [UInt8]) {
+    public static func write(_ value: [Int32], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for item in value {
-            FfiConverterUInt32.write(item, into: &buf)
+            FfiConverterInt32.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Int32] {
         let len: Int32 = try readInt(&buf)
-        var seq = [UInt32]()
+        var seq = [Int32]()
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
-            seq.append(try FfiConverterUInt32.read(from: &buf))
+            seq.append(try FfiConverterInt32.read(from: &buf))
         }
         return seq
     }
@@ -1547,6 +1651,18 @@ fileprivate struct FfiConverterSequenceTypeSentenceRange: FfiConverterRustBuffer
     }
 }
 /**
+ * Detect the binary format of the dictionary file at `path` by reading its
+ * header only. Useful for deciding whether a previously downloaded `.dic`
+ * needs to be replaced.
+ */
+public func dictionaryFormat(path: String) -> DictionaryFormat  {
+    return try!  FfiConverterTypeDictionaryFormat_lift(try! rustCall() {
+    uniffi_sudachi_swift_fn_func_dictionary_format(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+/**
  * Get the library version
  */
 public func getVersion() -> String  {
@@ -1582,13 +1698,16 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_sudachi_swift_checksum_func_dictionary_format() != 21515) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sudachi_swift_checksum_func_get_version() != 831) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sudachi_swift_checksum_func_split_sentences() != 34300) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sudachi_swift_checksum_method_tokenizer_lookup() != 30566) {
+    if (uniffi_sudachi_swift_checksum_method_tokenizer_lookup() != 59661) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sudachi_swift_checksum_method_tokenizer_pos_of() != 13682) {
