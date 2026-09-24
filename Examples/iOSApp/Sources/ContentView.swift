@@ -6,6 +6,10 @@ struct ContentView: View {
     @State private var result = ""
     @State private var selectedMode: TokenizeMode = .a
     @State private var dictionaryStatus = "Checking..."
+    // Loading a dictionary takes tens of milliseconds or more, so the
+    // tokenizer is created once (on first use) and reused.
+    @State private var tokenizer: Tokenizer?
+    @State private var isTokenizing = false
 
     var body: some View {
         NavigationView {
@@ -23,9 +27,9 @@ struct ContentView: View {
                         Text("C (Long)").tag(TokenizeMode.c)
                     }
                     Button("Tokenize") {
-                        tokenize()
+                        Task { await tokenize() }
                     }
-                    .disabled(dictionaryStatus != "Ready")
+                    .disabled(dictionaryStatus != "Ready" || isTokenizing)
                 }
 
                 Section("Result") {
@@ -78,12 +82,24 @@ struct ContentView: View {
         }
     }
 
-    func tokenize() {
-        guard dictionaryStatus == "Ready" else { return }
+    @MainActor
+    func tokenize() async {
+        guard dictionaryStatus == "Ready", !isTokenizing else { return }
+        isTokenizing = true
+        defer { isTokenizing = false }
 
+        let cached = tokenizer
+        let path = getDictionaryPath()
+        let text = inputText
+        let mode = selectedMode
         do {
-            let tokenizer = try Tokenizer.create(dictionaryPath: getDictionaryPath())
-            let morphemes = try tokenizer.tokenize(text: inputText, mode: selectedMode)
+            // Load the dictionary (first time only) and tokenize off the main
+            // thread, so the UI stays responsive.
+            let (loaded, morphemes) = try await Task.detached(priority: .userInitiated) {
+                let tokenizer = try cached ?? Tokenizer.create(dictionaryPath: path)
+                return (tokenizer, try tokenizer.tokenize(text: text, mode: mode))
+            }.value
+            tokenizer = loaded
 
             var output = ""
             for m in morphemes {
@@ -94,6 +110,8 @@ struct ContentView: View {
             }
             result = output
 
+        } catch let error as SudachiError {
+            result = "Error: \(error.message)"
         } catch {
             result = "Error: \(error)"
         }
