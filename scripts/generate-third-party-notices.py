@@ -44,13 +44,15 @@ SUBMODULE = REPO_ROOT / "sudachi.rs"
 RESOURCES = REPO_ROOT / "Sources" / "SudachiSwift" / "Resources"
 
 # Every Rust target triple that ends up in SudachiSwift.xcframework
-# (scripts/build-local.sh, including the nightly/tier-3 slices).
+# (scripts/build-local.sh).
 TARGETS = [
     "aarch64-apple-ios",
     "aarch64-apple-ios-sim",
     "x86_64-apple-ios",
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
+    "aarch64-apple-ios-macabi",
+    "x86_64-apple-ios-macabi",
     "aarch64-apple-tvos",
     "aarch64-apple-tvos-sim",
     "aarch64-apple-visionos",

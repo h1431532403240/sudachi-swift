@@ -23,8 +23,7 @@ Swift bindings for [sudachi.rs](https://github.com/WorksApplications/sudachi.rs)
 
 ## Requirements
 
-- **Stable:** iOS 13.0+ / macOS 10.15+ / Mac Catalyst 13.0+
-- **Nightly:** iOS 13.0+ / macOS 10.15+ / Mac Catalyst 13.0+ / tvOS 13.0+ / visionOS 1.0+ *(uses Rust nightly `-Z build-std` — treat as experimental)*
+- iOS 13.0+ / macOS 10.15+ / Mac Catalyst 13.0+ / tvOS 13.0+ / visionOS 1.0+, all in the same release. The tvOS and visionOS Simulator slices are arm64 only (Apple silicon Macs); see [tvOS and visionOS Simulator](#tvos-and-visionos-simulator).
 - Swift 5.9+
 - A **V1-format** Sudachi dictionary `.dic` file, SudachiDict 20260723 or later (see [Dictionary Setup](#dictionary-setup)). The V0 dictionaries used with SudachiSwift 0.6.x don't load.
 
@@ -44,19 +43,13 @@ Pin the exact version. SudachiSwift versions follow sudachi.rs, and upstream cal
 
 **Upgrading from 0.6.x?** 0.7.0 needs new dictionaries. See [Upgrading from 0.6.x](#upgrading-from-06x).
 
-For tvOS / visionOS as well (Tier 3 targets via the Rust nightly build):
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/h1431532403240/sudachi-swift", exact: "0.7.0-nightly")
-]
-```
-
-The `-nightly` tag is a separate prerelease, published only when that release's nightly build succeeds. Check [Releases](https://github.com/h1431532403240/sudachi-swift/releases) for it.
-
-The nightly visionOS Simulator slice is arm64 only, because Rust has no x86_64 visionOS target. A build for the generic visionOS Simulator destination also builds x86_64 and fails to link. Set `EXCLUDED_ARCHS[sdk=xrsimulator*] = x86_64` in your project's build settings or an `.xcconfig`. On the `xcodebuild` command line, pass `ARCHS=arm64` (or `EXCLUDED_ARCHS=x86_64`) instead, because the conditional `[sdk=…]` form doesn't work there.
+All platforms ship in the one regular release, because they all build with stable Rust now. Up to 0.6.x, tvOS and visionOS needed the Rust nightly compiler (`-Z build-std`) and shipped only in separate `-nightly` prereleases (for example `exact: "0.6.11-nightly"`, which stays available). From 0.7.0 on there are no `-nightly` tags; pin the regular version.
 
 SudachiSwift is distributed through Swift Package Manager only.
+
+### tvOS and visionOS Simulator
+
+The tvOS and visionOS Simulator slices are arm64 only, so they run on Apple silicon Macs. Rust's x86_64 tvOS target has no prebuilt standard library (it is Tier 3), and Rust has no x86_64 visionOS target at all. A build for a generic simulator destination (**Any tvOS Simulator Device**, **Any visionOS Simulator Device**) also builds x86_64 and fails to link. Set `EXCLUDED_ARCHS[sdk=appletvsimulator*] = x86_64` and `EXCLUDED_ARCHS[sdk=xrsimulator*] = x86_64` in your project's build settings or an `.xcconfig`. On the `xcodebuild` command line, pass `ARCHS=arm64` (or `EXCLUDED_ARCHS=x86_64`) instead, because the conditional `[sdk=…]` form doesn't work there.
 
 ## Dictionary Setup
 
@@ -408,7 +401,11 @@ tests/spm-consumer/            # CI fixture that builds the package as an extern
 git clone --recursive https://github.com/h1431532403240/sudachi-swift
 cd sudachi-swift
 
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
+rustup target add aarch64-apple-darwin x86_64-apple-darwin \
+  aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+  aarch64-apple-ios-macabi x86_64-apple-ios-macabi \
+  aarch64-apple-tvos aarch64-apple-tvos-sim \
+  aarch64-apple-visionos aarch64-apple-visionos-sim
 cargo install cargo-swift --version 0.11.1 --locked
 
 cargo test --manifest-path rust/Cargo.toml   # Rust wrapper tests (uses the submodule's test dictionaries)
@@ -416,6 +413,8 @@ cargo test --manifest-path rust/Cargo.toml   # Rust wrapper tests (uses the subm
 swift build
 cd Examples/BasicUsage && SUDACHI_DICT_PATH=/path/to/system.dic swift run BasicUsage
 ```
+
+Everything builds with stable Rust. The tvOS and visionOS targets need a Rust release that ships their standard library: CI uses the version pinned as `RUST_STABLE` in `.github/workflows/build.yml`. With an older toolchain, or to save time, build a subset: `PLATFORMS="macos ios" ./scripts/build-local.sh` (any of `macos ios maccatalyst tvos visionos`). The script checks that the targets are installed, builds the tvOS Simulator slice for arm64 only (cargo-swift's `--exclude-arch x86_64-apple-tvos`, see [tvOS and visionOS Simulator](#tvos-and-visionos-simulator)), and fails unless the XCFramework holds exactly the slices of the requested platforms.
 
 `build-local.sh` requires cargo-swift **0.11.1** exactly. cargo-swift generates the Swift bindings with its own bundled `uniffi_bindgen`, and that has to match the uniffi version the crate is compiled with (`=0.31.1` in `rust/Cargo.toml`). The script then patches the generated `sudachi_swift.swift` to decode strings with `String(decoding:as: UTF8.self)` instead of `String(bytes:encoding:)`, which drops a leading U+FEFF.
 
@@ -442,7 +441,7 @@ Without the secret, the PR is opened with `GITHUB_TOKEN`, and its `pull_request`
 
 The workflow also opens an issue when the check itself fails. GitHub disables scheduled workflows after 60 days without repository activity, so once the last commit on the default branch is 45 or more days old, the workflow re-enables itself daily through the REST API (a best-effort keepalive: GitHub doesn't document whether that resets the timer) and opens a warning issue.
 
-Merging the PR publishes nothing. To ship, run the **Release** workflow (`release.yml`) from `main` with the new version. It stops unless the version equals `version` in `rust/Cargo.toml`, which the bump PR sets. The stable release is published right after its tag is pushed. When the Rust nightly build succeeds, a separate `<version>-nightly` prerelease follows; its tag is not on `main`.
+Merging the PR publishes nothing. To ship, run the **Release** workflow (`release.yml`) from `main` with the new version. It stops unless the version equals `version` in `rust/Cargo.toml`, which the bump PR sets. It builds the XCFramework for every platform, smoke tests it (including Mac Catalyst, tvOS and visionOS builds), and publishes the release right after its tag is pushed.
 
 ## License
 
