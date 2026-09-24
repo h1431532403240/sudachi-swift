@@ -382,7 +382,7 @@ Opening the PR needs one of these:
 
 Without the secret, the PR is opened with `GITHUB_TOKEN`, and its `pull_request` CI would wait for approval. The workflow therefore dispatches `build.yml` on the bump branch instead. With neither, the branch is still pushed and the tracking issue gets a comment with a compare link to open the PR by hand.
 
-The workflow also opens an issue when the check itself fails. It opens a warning issue once the last commit on the default branch is 45 or more days old, because GitHub disables scheduled workflows after 60 days without repository activity.
+The workflow also opens an issue when the check itself fails. GitHub disables scheduled workflows after 60 days without repository activity, so once the last commit on the default branch is 45 or more days old, the workflow re-enables itself daily through the REST API (a best-effort keepalive: GitHub doesn't document whether that resets the timer) and opens a warning issue.
 
 Merging the PR publishes nothing. To ship, run the **Release** workflow (`release.yml`) from `main` with the new version. It stops unless the version equals `version` in `rust/Cargo.toml`, which the bump PR sets. The stable release is published right after its tag is pushed. When the Rust nightly build succeeds, a separate `<version>-nightly` prerelease follows; its tag is not on `main`.
 
