@@ -44,6 +44,11 @@ rm -rf "$CARGO_SWIFT_PKG"
 cargo_cmd=(cargo swift package)
 [ "$NIGHTLY" = "1" ] && cargo_cmd=(cargo +nightly -Z build-std swift package)
 
+# cargo-swift 0.11.1 marks --xcframework-name as deprecated (the name will be
+# derived from the FFI module name in uniffi.toml), but still honours it; the
+# RustFramework.xcframework path below depends on it. Bumping
+# CARGO_SWIFT_VERSION requires re-checking the output layout (both
+# GENERATED_* paths) before relying on this script.
 cargo_args=(--name SudachiSwift --xcframework-name RustFramework --skip-toolchains-check -y)
 [ "$PROFILE" = "release" ] && cargo_args+=(--release)
 read -ra platform_arr <<< "$PLATFORMS"

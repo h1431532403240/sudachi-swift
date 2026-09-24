@@ -537,6 +537,12 @@ public protocol TokenizerProtocol: AnyObject, Sendable {
     /**
      * Sentence-split `text` using this tokenizer's lexicon to avoid breaking
      * inside known multi-character expressions.
+     *
+     * Caveat: with sudachi.rs 0.6.11–0.7.0, a boundary right after a lexicon
+     * entry such as `。` is not split when more text follows (upstream
+     * `sentence_detector` bug), so real dictionaries often return the whole
+     * text as one range. Use the free function `split_sentences`
+     * (`splitSentences(text:)` in Swift) for rule-based splitting.
      */
     func splitSentences(text: String)  -> [SentenceRange]
     
@@ -655,6 +661,12 @@ open func posOf(posId: UInt32) -> [String]?  {
     /**
      * Sentence-split `text` using this tokenizer's lexicon to avoid breaking
      * inside known multi-character expressions.
+     *
+     * Caveat: with sudachi.rs 0.6.11–0.7.0, a boundary right after a lexicon
+     * entry such as `。` is not split when more text follows (upstream
+     * `sentence_detector` bug), so real dictionaries often return the whole
+     * text as one range. Use the free function `split_sentences`
+     * (`splitSentences(text:)` in Swift) for rule-based splitting.
      */
 open func splitSentences(text: String) -> [SentenceRange]  {
     return try!  FfiConverterSequenceTypeSentenceRange.lift(try! rustCall() {
@@ -791,8 +803,9 @@ public struct MorphemeInfo: Equatable, Hashable {
      */
     public var partOfSpeechId: UInt32
     /**
-     * Dictionary ID (0 for the system dictionary, 1+ for user dictionaries
-     * in the order given, -1 for OOV)
+     * Dictionary ID: 0 = system; 1+ = user dictionaries, numbered with the
+     * config file's `userDict` entries first, then `user_dictionary_paths`;
+     * -1 = OOV.
      */
     public var dictionaryId: Int32
     /**
@@ -850,8 +863,9 @@ public struct MorphemeInfo: Equatable, Hashable {
          * Part-of-speech numeric ID
          */partOfSpeechId: UInt32, 
         /**
-         * Dictionary ID (0 for the system dictionary, 1+ for user dictionaries
-         * in the order given, -1 for OOV)
+         * Dictionary ID: 0 = system; 1+ = user dictionaries, numbered with the
+         * config file's `userDict` entries first, then `user_dictionary_paths`;
+         * -1 = OOV.
          */dictionaryId: Int32, 
         /**
          * Synonym group IDs this morpheme belongs to
@@ -961,8 +975,9 @@ public struct MorphemeWithSubunits: Equatable, Hashable {
      */
     public var morpheme: MorphemeInfo
     /**
-     * Sub-unit decomposition (e.g. from A mode). If the morpheme cannot be
-     * split further, this contains exactly one element equal to `morpheme`.
+     * Sub-unit decomposition (e.g. from A mode). If the morpheme can't be
+     * split further, this is `[morpheme]` when `add_single` was true and
+     * empty when it was false.
      */
     public var subunits: [MorphemeInfo]
 
@@ -973,8 +988,9 @@ public struct MorphemeWithSubunits: Equatable, Hashable {
          * The primary morpheme (e.g. from C mode).
          */morpheme: MorphemeInfo, 
         /**
-         * Sub-unit decomposition (e.g. from A mode). If the morpheme cannot be
-         * split further, this contains exactly one element equal to `morpheme`.
+         * Sub-unit decomposition (e.g. from A mode). If the morpheme can't be
+         * split further, this is `[morpheme]` when `add_single` was true and
+         * empty when it was false.
          */subunits: [MorphemeInfo]) {
         self.morpheme = morpheme
         self.subunits = subunits
@@ -1107,7 +1123,9 @@ public func FfiConverterTypeSentenceRange_lower(_ value: SentenceRange) -> RustB
  */
 public struct TokenizerConfig: Equatable, Hashable {
     /**
-     * Path to the system dictionary file (.dic)
+     * Path to the system dictionary file (.dic), in binary format V1. A
+     * relative path resolves like resources (see `resource_path`, then the
+     * current directory); prefer absolute paths.
      */
     public var dictionaryPath: String
     /**
@@ -1119,12 +1137,17 @@ public struct TokenizerConfig: Equatable, Hashable {
      * Optional resource directory (where char.def, unk.def, rewrite.def are
      * located). Resources are resolved in sudachi.rs order: this directory,
      * then the config's `path` field, then the config file's directory, then
-     * the defaults embedded in sudachi.rs.
+     * the defaults embedded in sudachi.rs. A missing directory or file is not
+     * an error: resolution silently falls back to the next location and, in
+     * the end, to the built-in defaults.
      */
     public var resourcePath: String?
     /**
-     * User dictionary files, applied in order. Mirrors the `userDict` array
-     * in `sudachi.json`.
+     * User dictionary files, applied in order and appended after the config
+     * file's `userDict` entries. Relative paths resolve like resources
+     * (`resource_path`, the config's `path` field, the config file's
+     * directory, then the current directory), not against the system `.dic`'s
+     * directory, so prefer absolute paths.
      */
     public var userDictionaryPaths: [String]
 
@@ -1132,7 +1155,9 @@ public struct TokenizerConfig: Equatable, Hashable {
     // declare one manually.
     public init(
         /**
-         * Path to the system dictionary file (.dic)
+         * Path to the system dictionary file (.dic), in binary format V1. A
+         * relative path resolves like resources (see `resource_path`, then the
+         * current directory); prefer absolute paths.
          */dictionaryPath: String, 
         /**
          * Optional path to sudachi.json config file. When omitted, the default
@@ -1142,11 +1167,16 @@ public struct TokenizerConfig: Equatable, Hashable {
          * Optional resource directory (where char.def, unk.def, rewrite.def are
          * located). Resources are resolved in sudachi.rs order: this directory,
          * then the config's `path` field, then the config file's directory, then
-         * the defaults embedded in sudachi.rs.
+         * the defaults embedded in sudachi.rs. A missing directory or file is not
+         * an error: resolution silently falls back to the next location and, in
+         * the end, to the built-in defaults.
          */resourcePath: String?, 
         /**
-         * User dictionary files, applied in order. Mirrors the `userDict` array
-         * in `sudachi.json`.
+         * User dictionary files, applied in order and appended after the config
+         * file's `userDict` entries. Relative paths resolve like resources
+         * (`resource_path`, the config's `path` field, the config file's
+         * directory, then the current directory), not against the system `.dic`'s
+         * directory, so prefer absolute paths.
          */userDictionaryPaths: [String]) {
         self.dictionaryPath = dictionaryPath
         self.configPath = configPath
@@ -1209,7 +1239,8 @@ public func FfiConverterTypeTokenizerConfig_lower(_ value: TokenizerConfig) -> R
 public enum DictionaryFormat: Equatable, Hashable {
     
     /**
-     * Binary format V1, the only format sudachi.rs 0.7+ can load.
+     * The header says binary format V1, the only format sudachi.rs 0.7+ can
+     * load (only the header is read: truncation beyond it isn't detected).
      */
     case v1
     /**
@@ -1652,8 +1683,8 @@ fileprivate struct FfiConverterSequenceTypeSentenceRange: FfiConverterRustBuffer
 }
 /**
  * Detect the binary format of the dictionary file at `path` by reading its
- * header only. Useful for deciding whether a previously downloaded `.dic`
- * needs to be replaced.
+ * header (the first 24 bytes) only. Useful for deciding whether a
+ * previously downloaded `.dic` needs to be replaced.
  */
 public func dictionaryFormat(path: String) -> DictionaryFormat  {
     return try!  FfiConverterTypeDictionaryFormat_lift(try! rustCall() {
@@ -1698,7 +1729,7 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_sudachi_swift_checksum_func_dictionary_format() != 21515) {
+    if (uniffi_sudachi_swift_checksum_func_dictionary_format() != 24743) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sudachi_swift_checksum_func_get_version() != 831) {
@@ -1713,7 +1744,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sudachi_swift_checksum_method_tokenizer_pos_of() != 13682) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sudachi_swift_checksum_method_tokenizer_split_sentences() != 59337) {
+    if (uniffi_sudachi_swift_checksum_method_tokenizer_split_sentences() != 33349) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sudachi_swift_checksum_method_tokenizer_tokenize() != 14556) {
