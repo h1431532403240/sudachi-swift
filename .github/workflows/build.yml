@@ -44,7 +44,7 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: ${{ env.RUST_STABLE }}
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
 
       - name: Cache Rust dependencies
         # Runs before the cargo-swift install: rust-cache leaves out anything
@@ -106,6 +106,13 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             -skipPackagePluginValidation
 
+      - name: Verify Mac Catalyst build
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            -skipPackagePluginValidation
+
       - name: Upload XCFramework artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -143,7 +150,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_NIGHTLY }}
           components: rust-src
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
 
       - name: Make the `nightly` toolchain name run the pinned nightly
         # Same as release.yml: build-local.sh's NIGHTLY=1 build runs cargo with
@@ -184,7 +191,7 @@ jobs:
       - name: Build XCFramework (All Platforms)
         env:
           NIGHTLY: "1"
-          PLATFORMS: "macos ios tvos visionos"
+          PLATFORMS: "macos ios maccatalyst tvos visionos"
         run: ./scripts/build-local.sh
 
       - name: Upload Tier 3 XCFramework

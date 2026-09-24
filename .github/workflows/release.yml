@@ -160,14 +160,14 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: ${{ env.RUST_STABLE }}
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
 
       - name: Install Rust (nightly)
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: ${{ env.RUST_NIGHTLY }}
           components: rust-src
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
 
       - name: Make the `nightly` toolchain name run the pinned nightly
         # build-local.sh's NIGHTLY=1 build runs cargo with
@@ -263,6 +263,15 @@ jobs:
           cd tests/spm-consumer
           SUDACHI_V0_DICT_PATH="$RUNNER_TEMP/dict-v0/system.dic" swift run Verify
 
+      - name: "Smoke test: Mac Catalyst build"
+        # The stable zip ships a Mac Catalyst slice; make sure an app can link it.
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            -derivedDataPath "$RUNNER_TEMP/dd-catalyst" \
+            -skipPackagePluginValidation
+
       - name: Package stable XCFramework
         run: |
           set -euo pipefail
@@ -310,7 +319,7 @@ jobs:
         timeout-minutes: 60
         env:
           NIGHTLY: "1"
-          PLATFORMS: "macos ios tvos visionos"
+          PLATFORMS: "macos ios maccatalyst tvos visionos"
         run: ./scripts/build-local.sh
 
       - name: "Smoke test: SPM consumer fixture (nightly)"

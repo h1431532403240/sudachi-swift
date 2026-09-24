@@ -2,7 +2,7 @@
 
 [![Release](https://img.shields.io/github/v/release/h1431532403240/sudachi-swift?label=release&color=blue)](https://github.com/h1431532403240/sudachi-swift/releases/latest)
 [![sudachi.rs](https://img.shields.io/badge/sudachi.rs-v0.7.0-orange)](https://github.com/WorksApplications/sudachi.rs/releases/tag/v0.7.0)
-[![Platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20macOS%20%7C%20tvOS%20%7C%20visionOS-lightgrey)](#requirements)
+[![Platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20macOS%20%7C%20Mac%20Catalyst%20%7C%20tvOS%20%7C%20visionOS-lightgrey)](#requirements)
 [![Swift Package Manager](https://img.shields.io/badge/SPM-compatible-brightgreen)](#installation)
 [![License](https://img.shields.io/github/license/h1431532403240/sudachi-swift)](LICENSE)
 [![Build](https://github.com/h1431532403240/sudachi-swift/actions/workflows/build.yml/badge.svg)](https://github.com/h1431532403240/sudachi-swift/actions/workflows/build.yml)
@@ -23,8 +23,8 @@ Swift bindings for [sudachi.rs](https://github.com/WorksApplications/sudachi.rs)
 
 ## Requirements
 
-- **Stable:** iOS 13.0+ / macOS 10.15+
-- **Nightly:** iOS 13.0+ / macOS 10.15+ / tvOS 13.0+ / visionOS 1.0+ *(uses Rust nightly `-Z build-std` — treat as experimental)*
+- **Stable:** iOS 13.0+ / macOS 10.15+ / Mac Catalyst 13.0+
+- **Nightly:** iOS 13.0+ / macOS 10.15+ / Mac Catalyst 13.0+ / tvOS 13.0+ / visionOS 1.0+ *(uses Rust nightly `-Z build-std` — treat as experimental)*
 - Swift 5.9+
 - A **V1-format** Sudachi dictionary `.dic` file, SudachiDict 20260723 or later (see [Dictionary Setup](#dictionary-setup)). The V0 dictionaries used with SudachiSwift 0.6.x don't load.
 
