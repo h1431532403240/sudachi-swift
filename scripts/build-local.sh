@@ -42,7 +42,14 @@ echo "==> Building XCFramework + UniFFI bindings (platforms: $PLATFORMS, profile
 rm -rf "$CARGO_SWIFT_PKG"
 
 cargo_cmd=(cargo swift package)
-[ "$NIGHTLY" = "1" ] && cargo_cmd=(cargo +nightly -Z build-std swift package)
+if [ "$NIGHTLY" = "1" ]; then
+    # cargo-swift runs its own `cargo build` per target, and `cargo +nightly -Z
+    # build-std swift ...` doesn't reliably reach those (with nightly-2026-09-23
+    # the tvOS build ran without build-std: "can't find crate for `core`").
+    # The environment is inherited by every child cargo.
+    export RUSTUP_TOOLCHAIN=nightly
+    export CARGO_UNSTABLE_BUILD_STD=std,panic_abort
+fi
 
 # cargo-swift 0.11.1 marks --xcframework-name as deprecated (the name will be
 # derived from the FFI module name in uniffi.toml), but still honours it; the
