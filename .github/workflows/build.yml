@@ -16,10 +16,9 @@ permissions:
 # Every `uses:` is pinned to a full commit SHA (comment: the tag or branch it
 # was taken from).
 env:
-  # Rust toolchains, pinned so CI builds with what release.yml ships with.
-  # Keep in sync with release.yml, which explains how to bump them.
+  # Rust toolchain, pinned so CI builds with what release.yml ships with.
+  # Keep in sync with release.yml, which explains how to bump it.
   RUST_STABLE: "1.98.1"
-  RUST_NIGHTLY: nightly-2026-09-24
   # Fail instead of silently installing an unpinned toolchain when something
   # asks rustup for one that isn't installed (e.g. `cargo +stable`).
   RUSTUP_AUTO_INSTALL: "0"
@@ -44,7 +43,10 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: ${{ env.RUST_STABLE }}
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
+          # Every platform's targets (scripts/build-local.sh builds them all).
+          # No x86_64-apple-tvos: it is Tier 3, so the tvOS Simulator slice is
+          # arm64 only, like visionOS's.
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi,aarch64-apple-tvos,aarch64-apple-tvos-sim,aarch64-apple-visionos,aarch64-apple-visionos-sim
 
       - name: Cache Rust dependencies
         # Runs before the cargo-swift install: rust-cache leaves out anything
@@ -71,7 +73,7 @@ jobs:
         # different dependency versions.
         run: cargo test --locked --manifest-path rust/Cargo.toml
 
-      - name: Build XCFramework + stage bindings (macOS + iOS)
+      - name: Build XCFramework + stage bindings (all platforms)
         run: ./scripts/build-local.sh
 
       - name: Verify root Package.swift via SPM consumer fixture
@@ -113,6 +115,41 @@ jobs:
             -destination 'generic/platform=macOS,variant=Mac Catalyst' \
             -skipPackagePluginValidation
 
+      - name: Verify tvOS build
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=tvOS' \
+            -skipPackagePluginValidation
+
+      - name: Verify tvOS Simulator build (arm64)
+        # The tvOS and visionOS Simulator slices are arm64 only (Rust's
+        # x86_64 tvOS target is Tier 3, and there is no x86_64 visionOS
+        # target). A generic simulator destination also builds x86_64, which
+        # can't link, so build arm64 only, as the README tells users to.
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=tvOS Simulator' \
+            -skipPackagePluginValidation \
+            ARCHS=arm64
+
+      - name: Verify visionOS build
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=visionOS' \
+            -skipPackagePluginValidation
+
+      - name: Verify visionOS Simulator build (arm64)
+        # arm64 only; see the tvOS Simulator step.
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=visionOS Simulator' \
+            -skipPackagePluginValidation \
+            ARCHS=arm64
+
       - name: Upload XCFramework artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -124,82 +161,6 @@ jobs:
         with:
           name: SudachiSwift-bindings
           path: Sources/SudachiSwift/sudachi_swift.swift
-
-  build-tier3:
-    runs-on: macos-15
-    # Also on manual dispatch, so the tvOS/visionOS nightly path can be tried
-    # on a branch (e.g. an upstream bump) before a release depends on it.
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    continue-on-error: true
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: recursive
-          persist-credentials: false # nothing below uses git credentials
-
-      - name: Install Rust (stable)
-        # For `cargo +$RUST_STABLE install` below; the nightly step after this
-        # one makes nightly the default toolchain.
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: ${{ env.RUST_STABLE }}
-
-      - name: Install Rust (nightly)
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: ${{ env.RUST_NIGHTLY }}
-          components: rust-src
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
-
-      - name: Make the `nightly` toolchain name run the pinned nightly
-        # Same as release.yml: build-local.sh's NIGHTLY=1 build runs cargo with
-        # RUSTUP_TOOLCHAIN=nightly. rustup accepts a symlinked toolchain
-        # directory, so point `nightly-<host>` at the pinned one (otherwise
-        # that name is not installed and the nightly build fails).
-        run: |
-          set -euo pipefail
-          HOST=$(rustc +"$RUST_NIGHTLY" -vV | sed -n 's/^host: //p')
-          TOOLCHAINS="$(rustup show home)/toolchains"
-          test -d "$TOOLCHAINS/$RUST_NIGHTLY-$HOST"
-          rm -rf "$TOOLCHAINS/nightly-$HOST"
-          ln -s "$RUST_NIGHTLY-$HOST" "$TOOLCHAINS/nightly-$HOST"
-          PINNED_HASH=$(rustc +"$RUST_NIGHTLY" -vV | sed -n 's/^commit-hash: //p')
-          ALIAS_HASH=$(RUSTUP_TOOLCHAIN=nightly rustc -vV | sed -n 's/^commit-hash: //p')
-          if [ -z "$PINNED_HASH" ] || [ "$ALIAS_HASH" != "$PINNED_HASH" ]; then
-            echo "::error::RUSTUP_TOOLCHAIN=nightly does not run $RUST_NIGHTLY"
-            exit 1
-          fi
-          RUSTUP_TOOLCHAIN=nightly rustc -V
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: rust
-
-      - name: Install cargo-swift (version pinned in scripts/build-local.sh)
-        # +$RUST_STABLE: the nightly step above made nightly the default
-        # toolchain (same as release.yml).
-        run: |
-          CARGO_SWIFT_VERSION=$(sed -n 's/^CARGO_SWIFT_VERSION="\([^"]*\)"$/\1/p' scripts/build-local.sh)
-          if [ -z "$CARGO_SWIFT_VERSION" ]; then
-            echo "::error file=scripts/build-local.sh::CARGO_SWIFT_VERSION not found"
-            exit 1
-          fi
-          cargo +"$RUST_STABLE" install cargo-swift --version "$CARGO_SWIFT_VERSION" --locked
-
-      - name: Build XCFramework (All Platforms)
-        env:
-          NIGHTLY: "1"
-          PLATFORMS: "macos ios maccatalyst tvos visionos"
-        run: ./scripts/build-local.sh
-
-      - name: Upload Tier 3 XCFramework
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: SudachiSwift-Tier3.xcframework
-          path: SudachiSwift.xcframework
-          if-no-files-found: ignore
 
   notices:
     # A job of its own, so a stale file doesn't hide the build and test

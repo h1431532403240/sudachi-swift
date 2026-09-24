@@ -218,11 +218,11 @@ jobs:
             R="sudachi.rs/resources/$f"
             if [ -f "$R" ] && [ "$(realpath "$R")" = "$(pwd -P)/$R" ]; then cp "$R" Sources/SudachiSwift/Resources/; else MISSING="$MISSING $f"; fi
           done
-          # Install pins `.package(url: "https://github.com/<owner>/sudachi-swift", exact: "<old>[-nightly]")`
+          # Install pins `.package(url: "https://github.com/<owner>/sudachi-swift", exact: "<old>")`
           # in the README and (commented) in the example manifests, plus the README's sudachi.rs badge.
           PIN_FILES="README.md Examples/BasicUsage/Package.swift Examples/iOSApp/Package.swift"
           # shellcheck disable=SC2086 # word splitting intended
-          perl -pi -e 's{^(\s*(?://\s*)?\.package\(url: "https://github\.com/[^"/]+/sudachi-swift", exact: ")\Q$ENV{OLD}\E((?:-nightly)?"\))}{$1$ENV{VERSION}$2}' $PIN_FILES
+          perl -pi -e 's{^(\s*(?://\s*)?\.package\(url: "https://github\.com/[^"/]+/sudachi-swift", exact: ")\Q$ENV{OLD}\E("\))}{$1$ENV{VERSION}$2}' $PIN_FILES
           perl -pi -e 'if (m{img\.shields\.io/badge/sudachi\.rs-v}) { s{v\Q$ENV{OLD}\E(?=[-)])}{v$ENV{VERSION}}g }' README.md
           # shellcheck disable=SC2086
           PINS=$(git diff --numstat -- $PIN_FILES | awk '{ n += $1 } END { print n + 0 }')
@@ -286,7 +286,7 @@ jobs:
             echo "- Classification: **$KIND** (breaking = major bump, or minor bump while major is 0)"
             echo "- Release notes mention breaking / caution / migration / dictionary format: **$CAUTION**"
             echo "- \`cargo check\` of \`rust/\` against $LATEST: **$COMPILE**"
-            echo "- Version pins \`exact: \"$OLD\"\` / \`\"$OLD-nightly\"\` (README, example manifests) and the README badge → \`$VERSION\`: **$PINS** line(s) updated"
+            echo "- Version pins \`exact: \"$OLD\"\` (README, example manifests) and the README badge → \`$VERSION\`: **$PINS** line(s) updated"
             echo "- \`rust/Cargo.lock\`: $LOCK"
             if [ -n "$MISSING" ]; then echo "- Bundled resources missing upstream or not regular files (not refreshed): $MISSING"; fi
             for S in $SUPERSEDED; do echo "- Supersedes #${S%%:*} (branch \`automation/sudachi-rs-${S#*:}\` may hold migration commits)"; done

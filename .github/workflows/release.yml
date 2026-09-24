@@ -24,73 +24,56 @@ concurrency:
 # Every `uses:` is pinned to a full commit SHA (comment: the tag or branch it
 # was taken from), since this workflow can push to main and publish releases.
 env:
-  # Rust toolchains, pinned so the shipped binary doesn't depend on which Rust
+  # Rust toolchain, pinned so the shipped binary doesn't depend on which Rust
   # is current on the day of the run. Keep in sync with build.yml. To bump:
-  # change both files in one PR, dispatch build.yml on that branch (its
-  # build-tier3 job runs only on dispatch or main), and release once it
-  # passes. RUST_NIGHTLY is rustup's dist date, one day after the commit date
-  # `rustc -V` prints: nightly-2026-09-24 is rustc 1.100.0-nightly (6eeff9a52
-  # 2026-09-23), the nightly build-tier3 passed with in CI.
+  # change both files in one PR, and release once build.yml passes on it.
+  # Every platform builds with it, so a new version must still ship the
+  # standard library of every target the "Install Rust" steps list.
   RUST_STABLE: "1.98.1"
-  RUST_NIGHTLY: nightly-2026-09-24
   # Fail instead of silently installing an unpinned toolchain when something
   # asks rustup for one that isn't installed (e.g. `cargo +stable`).
   RUSTUP_AUTO_INSTALL: "0"
 
-# Recovery. The tags pin each zip's checksum in Package.swift and a rebuild
+# Recovery. The tag pins the zip's checksum in Package.swift and a rebuild
 # can't reproduce it (zip records file mtimes), so `build` keeps the exact
-# zips as artifacts: release-vX.Y.Z-stable and release-vX.Y.Z-nightly.
-# - `build` failed, or `publish` failed before "Push stable release commit and
-#   tag": nothing was pushed, so dispatch the release again. If only
+# zip as an artifact: release-vX.Y.Z-xcframework.
+# - `build` failed, or `publish` failed before "Push release commit and tag":
+#   nothing was pushed, so dispatch the release again. If only
 #   `publish` failed, "Re-run failed jobs" also works and skips the rebuild:
 #   the re-run uses the build job's outputs and artifacts. (If main moved
 #   meanwhile, its atomic push is refused; dispatch again from the new main.)
 # - vX.Y.Z was pushed but its GitHub Release is missing or has no asset. Don't
 #   re-run: validation refuses an existing tag, and a new build would not
 #   match the tagged checksum. Instead:
-#     gh run download <run-id> -n release-vX.Y.Z-stable
+#     gh run download <run-id> -n release-vX.Y.Z-xcframework
 #     shasum -a 256 SudachiSwift.xcframework.zip
 #       (the same value as `swift package compute-checksum`; must equal
 #       `let checksum` in Package.swift at tag vX.Y.Z)
 #     gh release create vX.Y.Z SudachiSwift.xcframework.zip --verify-tag --generate-notes
 #       (or `gh release upload vX.Y.Z SudachiSwift.xcframework.zip` if the
 #       release exists but has no asset)
-# - vX.Y.Z-nightly was pushed but its prerelease is missing:
-#     gh run download <run-id> -n release-vX.Y.Z-nightly
-#     shasum -a 256 SudachiSwift-nightly.xcframework.zip
-#       (must equal `let checksum` in Package.swift at tag vX.Y.Z-nightly)
-#     gh release create vX.Y.Z-nightly SudachiSwift-nightly.xcframework.zip \
-#       --verify-tag --prerelease --latest=false
-# - The stable release is complete but vX.Y.Z-nightly was never pushed: the
-#   nightly is optional, so it can be skipped for this version. To publish it
-#   by hand, check out vX.Y.Z, set Package.swift's version to X.Y.Z-nightly,
-#   its checksum to the nightly zip's, and the zip name in its URL to
-#   SudachiSwift-nightly.xcframework.zip; commit on the detached HEAD, tag
-#   vX.Y.Z-nightly, push only the tag, then create the prerelease as above.
 
 jobs:
   # ===========================================
-  # build: validate the inputs, then build and smoke test the stable and
-  # nightly XCFrameworks and hand the results to `publish` as artifacts. It
-  # runs crates.io build scripts (the cargo-swift install and both builds),
-  # so its token is read-only and kept out of .git/config, and it pushes
-  # nothing. Whatever those scripts do to this runner (git hooks or config,
-  # downloaded action code) stays here: `publish` runs on a fresh one.
+  # build: validate the inputs, then build and smoke test the XCFramework
+  # and hand the results to `publish` as artifacts. It runs crates.io build
+  # scripts (the cargo-swift install and the build), so its token is
+  # read-only and kept out of .git/config, and it pushes nothing. Whatever
+  # those scripts do to this runner (git hooks or config, downloaded action
+  # code) stays here: `publish` runs on a fresh one.
   # ===========================================
   build:
     # Same image as build.yml; macos-14 is being retired
     # (https://github.com/actions/runner-images/issues/13518).
     runs-on: macos-15
-    # Stable build + smoke tests take ~30 min; the optional nightly steps have
-    # their own limits below, so a hang there can't hold the stable release.
-    timeout-minutes: 150
+    # The build (11 Rust targets, every platform) plus the smoke tests.
+    timeout-minutes: 120
     permissions:
       contents: read
     outputs:
-      # Only hints for `publish`, which re-validates both (this job ran
-      # third-party code) and recomputes the checksums itself.
+      # Only a hint for `publish`, which re-validates it (this job ran
+      # third-party code) and recomputes the checksum itself.
       version: ${{ steps.validate.outputs.version }}
-      nightly_available: ${{ steps.nightly.outputs.available }}
     env:
       # Smoke-test dictionaries: the same pins as build.yml's test job (keep
       # the three values in sync with it).
@@ -131,8 +114,8 @@ jobs:
             exit 1
           fi
 
-          # The stable push fast-forwards main (see "Push stable release
-          # commit and tag"), so the release commit must be built from main.
+          # The release push fast-forwards main (see "Push release commit and
+          # tag"), so the release commit must be built from main.
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "::error::Dispatch Release from main (got $GITHUB_REF)"
             exit 1
@@ -142,13 +125,12 @@ jobs:
           # `git tag` after the build; a published tag is never moved.
           # (ls-remote needs no credentials: the repository is public, as
           # the release download URLs in Package.swift require.)
-          for TAG in "v$VERSION" "v$VERSION-nightly"; do
-            REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/$TAG")
-            if [ -n "$REMOTE_TAG" ] || git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-              echo "::error::Tag $TAG already exists; bump rust/Cargo.toml for a new release, or see the recovery notes in release.yml if v$VERSION's release is incomplete"
-              exit 1
-            fi
-          done
+          TAG="v$VERSION"
+          REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/$TAG")
+          if [ -n "$REMOTE_TAG" ] || git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists; bump rust/Cargo.toml for a new release, or see the recovery notes in release.yml if $TAG's release is incomplete"
+            exit 1
+          fi
 
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -160,37 +142,12 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: ${{ env.RUST_STABLE }}
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
-
-      - name: Install Rust (nightly)
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: ${{ env.RUST_NIGHTLY }}
-          components: rust-src
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
-
-      - name: Make the `nightly` toolchain name run the pinned nightly
-        # build-local.sh's NIGHTLY=1 build runs cargo with
-        # RUSTUP_TOOLCHAIN=nightly. rustup accepts a symlinked toolchain
-        # directory, so point `nightly-<host>` at the pinned one (otherwise
-        # that name is not installed and the nightly build fails).
-        run: |
-          set -euo pipefail
-          HOST=$(rustc +"$RUST_NIGHTLY" -vV | sed -n 's/^host: //p')
-          TOOLCHAINS="$(rustup show home)/toolchains"
-          test -d "$TOOLCHAINS/$RUST_NIGHTLY-$HOST"
-          rm -rf "$TOOLCHAINS/nightly-$HOST"
-          ln -s "$RUST_NIGHTLY-$HOST" "$TOOLCHAINS/nightly-$HOST"
-          PINNED_HASH=$(rustc +"$RUST_NIGHTLY" -vV | sed -n 's/^commit-hash: //p')
-          ALIAS_HASH=$(RUSTUP_TOOLCHAIN=nightly rustc -vV | sed -n 's/^commit-hash: //p')
-          if [ -z "$PINNED_HASH" ] || [ "$ALIAS_HASH" != "$PINNED_HASH" ]; then
-            echo "::error::RUSTUP_TOOLCHAIN=nightly does not run $RUST_NIGHTLY"
-            exit 1
-          fi
-          RUSTUP_TOOLCHAIN=nightly rustc -V
+          # The same targets as build.yml: every platform the XCFramework
+          # ships (no x86_64-apple-tvos, a Tier 3 target; the tvOS and
+          # visionOS Simulator slices are arm64 only).
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi,aarch64-apple-tvos,aarch64-apple-tvos-sim,aarch64-apple-visionos,aarch64-apple-visionos-sim
 
       - name: Install cargo-swift (version pinned in scripts/build-local.sh)
-        # +$RUST_STABLE: the nightly step above made nightly the default toolchain.
         run: |
           CARGO_SWIFT_VERSION=$(sed -n 's/^CARGO_SWIFT_VERSION="\([^"]*\)"$/\1/p' scripts/build-local.sh)
           if [ -z "$CARGO_SWIFT_VERSION" ]; then
@@ -214,16 +171,18 @@ jobs:
         run: python3 scripts/generate-third-party-notices.py --check
 
       # ===========================================
-      # Build Stable (iOS + macOS)
+      # Build (iOS, macOS, Mac Catalyst, tvOS, visionOS; all stable Rust)
       # ===========================================
-      - name: Use stable toolchain for build
+      - name: Use the pinned toolchain for the build
+        # cargo-swift runs plain `cargo build` and `rustup target list`, so
+        # the pinned toolchain must be the default one.
         run: rustup default "$RUST_STABLE"
 
-      - name: Build stable XCFramework + stage bindings
+      - name: Build XCFramework + stage bindings (all platforms)
         run: ./scripts/build-local.sh
 
       # ===========================================
-      # Smoke test the stable build before anything is published. The tag is
+      # Smoke test the build before anything is published. The tag is
       # never moved and pins this exact binary's checksum, while build.yml
       # tested a different build, so run the same checks against this one.
       # The root Package.swift uses ./SudachiSwift.xcframework when it exists,
@@ -263,8 +222,10 @@ jobs:
           cd tests/spm-consumer
           SUDACHI_V0_DICT_PATH="$RUNNER_TEMP/dict-v0/system.dic" swift run Verify
 
+      # The zip also ships Mac Catalyst, tvOS and visionOS slices; make sure
+      # each one links. The simulator builds are arm64 only, like their
+      # slices (see build.yml's verification builds).
       - name: "Smoke test: Mac Catalyst build"
-        # The stable zip ships a Mac Catalyst slice; make sure an app can link it.
         run: |
           xcodebuild build \
             -scheme SudachiSwift \
@@ -272,17 +233,50 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/dd-catalyst" \
             -skipPackagePluginValidation
 
-      - name: Package stable XCFramework
+      - name: "Smoke test: tvOS build"
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd-tvos" \
+            -skipPackagePluginValidation
+
+      - name: "Smoke test: tvOS Simulator build (arm64)"
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/dd-tvos" \
+            -skipPackagePluginValidation \
+            ARCHS=arm64
+
+      - name: "Smoke test: visionOS build"
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=visionOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd-visionos" \
+            -skipPackagePluginValidation
+
+      - name: "Smoke test: visionOS Simulator build (arm64)"
+        run: |
+          xcodebuild build \
+            -scheme SudachiSwift \
+            -destination 'generic/platform=visionOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/dd-visionos" \
+            -skipPackagePluginValidation \
+            ARCHS=arm64
+
+      - name: Package XCFramework
         run: |
           set -euo pipefail
           zip -r SudachiSwift.xcframework.zip SudachiSwift.xcframework
           # For the log only: `publish` recomputes the checksum it commits.
-          echo "Stable checksum: $(swift package compute-checksum SudachiSwift.xcframework.zip)"
+          echo "Checksum: $(swift package compute-checksum SudachiSwift.xcframework.zip)"
 
-      - name: Stage stable bindings and resources for publish
+      - name: Stage bindings and resources for publish
         # `publish` commits these next to Package.swift, as the files the
-        # stable XCFramework was built and tested with. The nightly build
-        # below overwrites the copies in Sources/.
+        # XCFramework was built and tested with.
         run: |
           set -euo pipefail
           rm -rf "$RUNNER_TEMP/release-sources"
@@ -291,114 +285,31 @@ jobs:
           cp -R Sources/SudachiSwift/Resources "$RUNNER_TEMP/release-sources/Resources"
 
       # Also the recovery copy of the exact zip (see Recovery at the top).
-      - name: Upload stable zip
+      - name: Upload zip
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-v${{ env.VERSION }}-stable
+          name: release-v${{ env.VERSION }}-xcframework
           path: SudachiSwift.xcframework.zip
           if-no-files-found: error
           # Already a zip.
           compression-level: 0
 
-      - name: Upload stable bindings and resources
+      - name: Upload bindings and resources
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-v${{ env.VERSION }}-sources
           path: ${{ runner.temp }}/release-sources/
           if-no-files-found: error
 
-      # ===========================================
-      # Build Nightly (All Platforms) - optional. A failure in any nightly
-      # step below only means no nightly prerelease: "Report nightly
-      # availability" sets nightly_available=false and the job still passes,
-      # so the stable release goes ahead.
-      # ===========================================
-      - name: Build nightly XCFramework (all platforms)
-        id: nightly-build
-        continue-on-error: true
-        timeout-minutes: 60
-        env:
-          NIGHTLY: "1"
-          PLATFORMS: "macos ios maccatalyst tvos visionos"
-        run: ./scripts/build-local.sh
-
-      - name: "Smoke test: SPM consumer fixture (nightly)"
-        # Same fixture, now linking the nightly XCFramework (the root
-        # Package.swift picks up ./SudachiSwift.xcframework, which the nightly
-        # build replaced). The nightly tag ships the stable build's bindings
-        # (see publish), so put those back first and test that pairing.
-        # A fresh scratch path: the stable run's build products are cached in
-        # the fixture's .build. The V0 check reuses the fixture dictionary
-        # when the stable smoke test could fetch it.
-        id: nightly-smoke
-        if: steps.nightly-build.outcome == 'success'
-        continue-on-error: true
-        timeout-minutes: 25
-        run: |
-          set -euo pipefail
-          if [ ! -f SudachiSwift.xcframework/Info.plist ]; then
-            echo "::error::SudachiSwift.xcframework/Info.plist not found after the nightly build."
-            exit 1
-          fi
-          cp "$RUNNER_TEMP/release-sources/sudachi_swift.swift" Sources/SudachiSwift/sudachi_swift.swift
-          if [ -f "$RUNNER_TEMP/dict-v0/system.dic" ]; then
-            export SUDACHI_V0_DICT_PATH="$RUNNER_TEMP/dict-v0/system.dic"
-          fi
-          (cd tests/spm-consumer && swift run --scratch-path "$RUNNER_TEMP/spm-consumer-nightly" Verify)
-          # Actually tokenize with the nightly (-Z build-std) binary too.
-          (cd Examples/BasicUsage && SUDACHI_DICT_PATH="$RUNNER_TEMP/dict-v1/system.dic" \
-            swift run --scratch-path "$RUNNER_TEMP/basicusage-nightly" BasicUsage)
-
-      - name: Package nightly XCFramework
-        id: nightly-package
-        if: steps.nightly-smoke.outcome == 'success'
-        continue-on-error: true
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          mv SudachiSwift.xcframework SudachiSwift-nightly.xcframework
-          zip -r SudachiSwift-nightly.xcframework.zip SudachiSwift-nightly.xcframework
-          # For the log only: `publish` recomputes the checksum it commits.
-          echo "Nightly checksum: $(swift package compute-checksum SudachiSwift-nightly.xcframework.zip)"
-
-      # Also the recovery copy of the exact zip (see Recovery at the top).
-      - name: Upload nightly zip
-        id: nightly-upload
-        if: steps.nightly-package.outcome == 'success'
-        continue-on-error: true
-        timeout-minutes: 10
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-v${{ env.VERSION }}-nightly
-          path: SudachiSwift-nightly.xcframework.zip
-          if-no-files-found: error
-          compression-level: 0
-
-      - name: Report nightly availability
-        id: nightly
-        env:
-          BUILD: ${{ steps.nightly-build.outcome }}
-          SMOKE: ${{ steps.nightly-smoke.outcome }}
-          PACKAGE: ${{ steps.nightly-package.outcome }}
-          UPLOAD: ${{ steps.nightly-upload.outcome }}
-        run: |
-          if [ "$UPLOAD" = success ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "Nightly XCFramework built, smoke tested and uploaded."
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No nightly prerelease for this release (nightly build: $BUILD, smoke test: $SMOKE, packaging: $PACKAGE, upload: $UPLOAD)."
-          fi
-
   # ===========================================
-  # publish: commit, tag, push and create the GitHub releases. The only job
+  # publish: commit, tag, push and create the GitHub release. The only job
   # with a write token, so it runs no third-party build code on a fresh
   # runner: no cargo, swift or repository scripts, only git, perl, unzip and
   # the runner's standard tools, plus the pinned checkout, download-artifact
   # and release actions.
-  # It takes only data from `build`: the zips, the bindings and resources to
-  # commit, and two outputs it re-validates; the checksums it commits are
-  # computed here from the zips it publishes.
+  # It takes only data from `build`: the zip, the bindings and resources to
+  # commit, and the version output it re-validates; the checksum it commits
+  # is computed here from the zip it publishes.
   # ===========================================
   publish:
     needs: build
@@ -409,7 +320,6 @@ jobs:
       # Passed via env so the raw values are never spliced into a script.
       VERSION_INPUT: ${{ github.event.inputs.version }}
       BUILD_VERSION: ${{ needs.build.outputs.version }}
-      NIGHTLY_AVAILABLE: ${{ needs.build.outputs.nightly_available }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -418,9 +328,9 @@ jobs:
           # commit doesn't change the sudachi.rs gitlink.
           ref: ${{ github.sha }}
           fetch-depth: 0
-          # Keep the write token out of .git/config: only the two push steps
-          # get it (GH_TOKEN, passed to that one git command), plus the two
-          # release steps (softprops/action-gh-release's default token).
+          # Keep the write token out of .git/config: only the push step gets
+          # it (GH_TOKEN, passed to that one git command), plus the release
+          # step (softprops/action-gh-release's default token).
           persist-credentials: false
 
       - name: Validate version, branch and tag
@@ -437,10 +347,6 @@ jobs:
             echo "::error::The build job reported a different version than the input $VERSION"
             exit 1
           fi
-          case "$NIGHTLY_AVAILABLE" in
-            true | false) ;;
-            *) echo "::error::The build job's nightly_available output is neither true nor false"; exit 1 ;;
-          esac
 
           CARGO_VERSION=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' rust/Cargo.toml)
           if [ "$VERSION" != "$CARGO_VERSION" ]; then
@@ -451,42 +357,30 @@ jobs:
             echo "::error::Dispatch Release from main (got $GITHUB_REF)"
             exit 1
           fi
-          for TAG in "v$VERSION" "v$VERSION-nightly"; do
-            REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/$TAG")
-            if [ -n "$REMOTE_TAG" ] || git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-              echo "::error::Tag $TAG already exists; see the recovery notes in release.yml"
-              exit 1
-            fi
-          done
+          TAG="v$VERSION"
+          REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/$TAG")
+          if [ -n "$REMOTE_TAG" ] || git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists; see the recovery notes in release.yml"
+            exit 1
+          fi
 
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      - name: Download stable zip
+      - name: Download zip
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: release-v${{ env.VERSION }}-stable
-          path: ${{ runner.temp }}/release/stable
+          name: release-v${{ env.VERSION }}-xcframework
+          path: ${{ runner.temp }}/release/xcframework
 
-      - name: Download stable bindings and resources
+      - name: Download bindings and resources
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-v${{ env.VERSION }}-sources
           path: ${{ runner.temp }}/release/sources
 
-      - name: Download nightly zip
-        # A missing or broken nightly zip only skips the nightly (see below).
-        if: env.NIGHTLY_AVAILABLE == 'true'
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: release-v${{ env.VERSION }}-nightly
-          path: ${{ runner.temp }}/release/nightly
-
-      - name: Commit and tag the releases (local only)
-        # The stable release commit goes on top of the built commit; main is
-        # fast-forwarded to it below. The nightly commit is a child of it that
-        # lives only on its tag (Package.swift differs, the sources don't), so
-        # main stays on the stable release commit. Nothing is pushed here.
+      - name: Commit and tag the release (local only)
+        # The release commit goes on top of the built commit; main is
+        # fast-forwarded to it below. Nothing is pushed here.
         run: |
           set -euo pipefail
           REL="$RUNNER_TEMP/release"
@@ -525,30 +419,29 @@ jobs:
             printf '%s\n' "$sum"
           }
 
-          # Sets Package.swift's `let version`, `let checksum` and the zip
-          # name in the release URL; fails unless each occurs exactly once.
+          # Sets Package.swift's `let version` and `let checksum`; fails
+          # unless each, and the release URL's zip name, occurs exactly once.
           # (perl, not `sed -i`, whose syntax differs between GNU and BSD.)
           set_package() {
-            PKG_VERSION="$1" PKG_CHECKSUM="$2" PKG_ZIP="$3" perl -0777 -pi -e '
+            PKG_VERSION="$1" PKG_CHECKSUM="$2" perl -0777 -pi -e '
               my $v = s/^let version = "[^"]*"$/let version = "$ENV{PKG_VERSION}"/mg;
               my $c = s/^let checksum = "[^"]*"$/let checksum = "$ENV{PKG_CHECKSUM}"/mg;
-              my $z = s{/SudachiSwift(?:-nightly)?\.xcframework\.zip"}{/$ENV{PKG_ZIP}"}g;
+              my $z = () = m{/SudachiSwift\.xcframework\.zip"}g;
               die sprintf("Package.swift: expected one version, checksum and zip URL, found %d, %d, %d\n",
                 $v || 0, $c || 0, $z || 0) unless $v == 1 && $c == 1 && $z == 1;
             ' Package.swift
             grep -E '^let (version|checksum) = |xcframework\.zip"' Package.swift
           }
 
-          # ---- Stable ----
-          if ! STABLE_CHECKSUM=$(zip_checksum "$REL/stable/SudachiSwift.xcframework.zip" SudachiSwift.xcframework); then
-            echo "::error::The stable zip artifact is missing or unusable (see above)"
+          if ! RELEASE_CHECKSUM=$(zip_checksum "$REL/xcframework/SudachiSwift.xcframework.zip" SudachiSwift.xcframework); then
+            echo "::error::The zip artifact is missing or unusable (see above)"
             exit 1
           fi
-          echo "Stable checksum: $STABLE_CHECKSUM"
-          set_package "$VERSION" "$STABLE_CHECKSUM" SudachiSwift.xcframework.zip
+          echo "Checksum: $RELEASE_CHECKSUM"
+          set_package "$VERSION" "$RELEASE_CHECKSUM"
 
-          # The generated bindings and bundled resources the stable build
-          # staged (see build-local.sh); regular files only.
+          # The generated bindings and bundled resources the build staged
+          # (see build-local.sh); regular files only.
           SRC="$REL/sources"
           RESOURCES=(char.def rewrite.def sudachi.json unk.def)
           EXPECTED=$( { printf '%s\n' . ./Resources ./sudachi_swift.swift; printf './Resources/%s\n' "${RESOURCES[@]}"; } | LC_ALL=C sort)
@@ -575,40 +468,22 @@ jobs:
           git commit -q -m "chore: release v$VERSION"
           git tag "v$VERSION"
           git --no-pager show --stat --format='%H %s' HEAD
-          echo "STABLE_CHECKSUM=$STABLE_CHECKSUM" >> "$GITHUB_ENV"
-
-          # ---- Nightly (optional) ----
-          NIGHTLY_READY=false
-          if [ "$NIGHTLY_AVAILABLE" = true ]; then
-            if NIGHTLY_CHECKSUM=$(zip_checksum "$REL/nightly/SudachiSwift-nightly.xcframework.zip" SudachiSwift-nightly.xcframework); then
-              echo "Nightly checksum: $NIGHTLY_CHECKSUM"
-              set_package "$VERSION-nightly" "$NIGHTLY_CHECKSUM" SudachiSwift-nightly.xcframework.zip
-              git add Package.swift
-              git commit -q -m "chore: release v$VERSION-nightly"
-              git tag "v$VERSION-nightly"
-              git --no-pager show --stat --format='%H %s' HEAD
-              echo "NIGHTLY_CHECKSUM=$NIGHTLY_CHECKSUM" >> "$GITHUB_ENV"
-              NIGHTLY_READY=true
-            else
-              echo "::warning::The nightly zip artifact is missing or unusable (see above); publishing the stable release only."
-            fi
-          fi
-          echo "NIGHTLY_READY=$NIGHTLY_READY" >> "$GITHUB_ENV"
+          echo "RELEASE_CHECKSUM=$RELEASE_CHECKSUM" >> "$GITHUB_ENV"
 
       # ===========================================
-      # Publish stable: push, then the GitHub Release right away, so the
+      # Publish: push, then the GitHub Release right away, so the
       # binaryTarget URL in the tagged Package.swift resolves.
       # ===========================================
-      - name: Push stable release commit and tag
+      - name: Push release commit and tag
         env:
-          # One of the two steps that get the write token (see checkout). It
-          # goes to the push only, as the same header actions/checkout would
+          # The only step that gets the write token for git (see checkout).
+          # It goes to the push only, as the same header actions/checkout would
           # have stored in .git/config, via GIT_CONFIG_* rather than
           # `git -c` so it isn't on a command line.
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          STABLE_COMMIT=$(git rev-parse --verify "refs/tags/v$VERSION^{commit}")
+          RELEASE_COMMIT=$(git rev-parse --verify "refs/tags/v$VERSION^{commit}")
           BASIC_AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
           echo "::add-mask::$BASIC_AUTH"
           # Atomic: if main moved since the dispatch, neither main nor the
@@ -617,16 +492,16 @@ jobs:
           GIT_CONFIG_COUNT=1 \
           GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
           GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $BASIC_AUTH" \
-            git push --atomic origin "$STABLE_COMMIT:refs/heads/main" "refs/tags/v$VERSION"
+            git push --atomic origin "$RELEASE_COMMIT:refs/heads/main" "refs/tags/v$VERSION"
 
-      - name: Create stable GitHub Release
+      - name: Create GitHub Release
         # The body recommends `exact:` because upstream sudachi.rs 0.x releases
         # may change behavior even in patch releases; revisit once sudachi.rs
         # reaches 1.0.
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: v${{ env.VERSION }}
-          files: ${{ runner.temp }}/release/stable/SudachiSwift.xcframework.zip
+          files: ${{ runner.temp }}/release/xcframework/SudachiSwift.xcframework.zip
           fail_on_unmatched_files: true
           body: |
             ## SudachiSwift v${{ env.VERSION }}
@@ -635,11 +510,12 @@ jobs:
 
             ### Installation
 
-            **Stable (iOS + macOS):**
             ```swift
             .package(url: "https://github.com/${{ github.repository }}", exact: "${{ env.VERSION }}")
             ```
             Pin the exact version: upstream sudachi.rs 0.x releases may change tokenization behavior even in patch releases.
+
+            **Platforms:** iOS 13+, macOS 10.15+, Mac Catalyst 13+, tvOS 13+ and visionOS 1+, all in this one XCFramework. The tvOS and visionOS Simulator slices are arm64 only (Apple silicon Macs); see [tvOS and visionOS Simulator](https://github.com/${{ github.repository }}/blob/v${{ env.VERSION }}/README.md#tvos-and-visionos-simulator).
 
             **Dictionary:** a V1-format SudachiDict dictionary is required; legacy V0 dictionaries are rejected. See [Dictionary Setup](https://github.com/${{ github.repository }}/blob/v${{ env.VERSION }}/README.md#dictionary-setup), and [Upgrading from 0.6.x](https://github.com/${{ github.repository }}/blob/v${{ env.VERSION }}/README.md#upgrading-from-06x) if you are coming from 0.6.
 
@@ -647,57 +523,7 @@ jobs:
 
             **Licenses:** the XCFramework statically links third-party Rust crates; their notices are in [THIRD_PARTY_NOTICES.md](https://github.com/${{ github.repository }}/blob/v${{ env.VERSION }}/THIRD_PARTY_NOTICES.md).
 
-            **tvOS / visionOS:** when the Rust nightly build succeeds, a separate `v${{ env.VERSION }}-nightly` prerelease is published under [Releases](https://github.com/${{ github.repository }}/releases).
-
             ### Checksum
-            - Stable: `${{ env.STABLE_CHECKSUM }}`
+            - `${{ env.RELEASE_CHECKSUM }}`
 
           generate_release_notes: true
-
-      # ===========================================
-      # Publish nightly (if its build, smoke test and zip made it): only the
-      # tag is pushed, so commits that land on main meanwhile can't make this
-      # push fail halfway, and main keeps the stable release commit.
-      # ===========================================
-      - name: Push nightly tag
-        if: env.NIGHTLY_READY == 'true'
-        env:
-          # The other step with the write token (see "Push stable release
-          # commit and tag").
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          BASIC_AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
-          echo "::add-mask::$BASIC_AUTH"
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
-          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $BASIC_AUTH" \
-            git push origin "refs/tags/v$VERSION-nightly"
-
-      - name: Create nightly GitHub prerelease
-        # The nightly tag's Package.swift downloads
-        # releases/download/v<version>-nightly/SudachiSwift-nightly.xcframework.zip,
-        # so the asset must live on a release for that tag (pushed above).
-        if: env.NIGHTLY_READY == 'true'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          tag_name: v${{ env.VERSION }}-nightly
-          prerelease: true
-          make_latest: false
-          files: ${{ runner.temp }}/release/nightly/SudachiSwift-nightly.xcframework.zip
-          fail_on_unmatched_files: true
-          body: |
-            ## SudachiSwift v${{ env.VERSION }}-nightly
-
-            Same sources as [v${{ env.VERSION }}](https://github.com/${{ github.repository }}/releases/tag/v${{ env.VERSION }}), with the XCFramework built by the Rust nightly compiler (`-Z build-std`) so it also covers tvOS and visionOS.
-
-            **Nightly (iOS, macOS, tvOS, visionOS):**
-            ```swift
-            .package(url: "https://github.com/${{ github.repository }}", exact: "${{ env.VERSION }}-nightly")
-            ```
-            > ⚠️ Nightly builds use Rust nightly compiler and may be unstable
-
-            A V1-format dictionary is required, and the clean-build note for updates applies, as for the stable release.
-
-            ### Checksum
-            - Nightly: `${{ env.NIGHTLY_CHECKSUM }}`
