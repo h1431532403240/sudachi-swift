@@ -161,8 +161,17 @@ public enum SudachiDictDistribution: String, CaseIterable, CustomStringConvertib
 
     /// URL of the V1-format `sudachi-dictionary-{version}-{distribution}.zip`
     /// archive on SudachiDict's CDN. Pass a specific version like `"20260723"`
-    /// to pin, or leave `nil` for the latest published release. V1 builds
-    /// exist from `20260723` onwards; older versions are V0 only.
+    /// to pin, or leave `nil` for `"latest"`.
+    ///
+    /// `"latest"` moves whenever SudachiDict publishes a new release, and a
+    /// user dictionary only loads with the exact system `.dic` file it was
+    /// built against (its signature, not just the release date: the PyPI
+    /// `sudachidict_*` packages are separate builds). If you ship user
+    /// dictionaries, pin `version:` and build them against this download.
+    ///
+    /// V1 builds exist from `20260723` onwards: earlier versions have no V1
+    /// build and return HTTP 404, so check the response status before
+    /// unzipping.
     public func downloadURL(version: String? = nil) -> URL {
         let v = version ?? "latest"
         let host = "https://d2ej7fkh96fzlu.cloudfront.net/sudachidict/v1"
@@ -195,8 +204,11 @@ public enum SudachiDictionaryStore {
         return appSupport.appendingPathComponent("SudachiSwift")
     }()
 
-    /// Conventional install path for a distribution. The file may not exist
-    /// yet — write your extracted `.dic` here after fetching it.
+    /// Conventional install path for a distribution. Neither the file nor
+    /// `directory` (``defaultDirectory`` unless you pass one) necessarily
+    /// exists yet: create the directory with
+    /// `FileManager.createDirectory(at:withIntermediateDirectories:attributes:)`
+    /// before writing your extracted `.dic` here.
     public static func dictionaryPath(
         for distribution: SudachiDictDistribution,
         in directory: URL = defaultDirectory
@@ -204,9 +216,17 @@ public enum SudachiDictionaryStore {
         directory.appendingPathComponent("system_\(distribution.rawValue).dic")
     }
 
-    /// `true` if a loadable (V1-format) `.dic` for `distribution` exists at
-    /// the conventional path. A V0 dictionary left over from SudachiSwift 0.6
-    /// reports `false`, so a "download if not installed" flow replaces it.
+    /// `true` if a `.dic` whose header says format V1 exists at
+    /// ``dictionaryPath(for:in:)``. Only the header is checked: an
+    /// interrupted download still reports `true`, so verify the size or
+    /// checksum of a download before moving it into place.
+    ///
+    /// A V0 dictionary left over from SudachiSwift 0.6 reports `false`, so a
+    /// "download if not installed" flow downloads again — but the old file
+    /// is still in place. Delete it before moving the new one in
+    /// (`FileManager.moveItem(at:to:)` fails when the destination exists), or
+    /// use `FileManager.replaceItemAt(_:withItemAt:backupItemName:options:)`,
+    /// and create the directory first if it doesn't exist yet.
     public static func isInstalled(
         _ distribution: SudachiDictDistribution,
         in directory: URL = defaultDirectory
@@ -217,7 +237,16 @@ public enum SudachiDictionaryStore {
     /// Look for a `.dic` to load. Searches the caller-supplied paths first,
     /// then ``defaultDirectory``, then `Bundle.main.resourceURL`. Recognised
     /// filenames are `system.dic` plus the per-distribution names
-    /// (`system_small.dic`, `system_core.dic`, `system_full.dic`).
+    /// (`system_small.dic`, `system_core.dic`, `system_full.dic`), tried in
+    /// that order in each location.
+    ///
+    /// Returns the first match whose ``dictionaryFormat(path:)`` is
+    /// ``DictionaryFormat/v1``, so a V0 file left over from SudachiSwift 0.6
+    /// doesn't hide a loadable dictionary elsewhere in the search order. Only
+    /// if no V1 file exists does it fall back to the first match in another
+    /// format, so that loading it reports why it can't be used (e.g. the
+    /// legacy-V0 error; a V0 file is preferred over an unreadable one for that
+    /// reason). Returns `nil` when nothing matches.
     public static func findDictionary(in additionalPaths: [URL] = []) -> URL? {
         var paths = additionalPaths
         paths.append(defaultDirectory)
@@ -225,21 +254,32 @@ public enum SudachiDictionaryStore {
             paths.append(bundleURL)
         }
         let filenames = ["system.dic"] + SudachiDictDistribution.allCases.map(\.dicFilename)
+        var legacyFallback: URL?
+        var otherFallback: URL?
         for path in paths {
             for name in filenames {
                 let candidate = path.appendingPathComponent(name)
-                if FileManager.default.fileExists(atPath: candidate.path) {
+                guard FileManager.default.fileExists(atPath: candidate.path) else { continue }
+                switch dictionaryFormat(path: candidate.path) {
+                case .v1:
                     return candidate
+                case .legacyV0:
+                    legacyFallback = legacyFallback ?? candidate
+                case .unknown:
+                    otherFallback = otherFallback ?? candidate
                 }
             }
         }
-        return nil
+        return legacyFallback ?? otherFallback
     }
 
-    /// Build a tokenizer from the first `.dic` ``findDictionary(in:)`` locates.
+    /// Build a tokenizer from the `.dic` ``findDictionary(in:)`` picks: the
+    /// first V1 dictionary in its search order, or, if there is none, the
+    /// first matching file in another format.
+    ///
     /// Throws ``SudachiError/DictionaryLoadError(message:)`` with an
-    /// actionable hint when no dictionary is installed, or when the one found
-    /// is a legacy V0 dictionary.
+    /// actionable hint when no dictionary is installed, or when no V1 file
+    /// was found and the fallback is a legacy V0 dictionary.
     public static func createTokenizer() throws -> Tokenizer {
         guard let path = findDictionary() else {
             throw SudachiError.DictionaryLoadError(
