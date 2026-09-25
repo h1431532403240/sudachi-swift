@@ -55,5 +55,13 @@ let package = Package(
             ]
         ),
         ffiTarget,
+        // Explicit path: SwiftPM's default `Tests/` would collide with the
+        // existing `tests/` directory on case-insensitive file systems.
+        // Packages that depend on SudachiSwift never build this target.
+        .testTarget(
+            name: "SudachiSwiftTests",
+            dependencies: ["SudachiSwift"],
+            path: "tests/SudachiSwiftTests"
+        ),
     ]
 )

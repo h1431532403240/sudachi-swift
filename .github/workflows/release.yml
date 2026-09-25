@@ -208,6 +208,12 @@ jobs:
           cd Examples/BasicUsage
           SUDACHI_DICT_PATH="$RUNNER_TEMP/dict-v1/system.dic" swift run BasicUsage
 
+      - name: "Smoke test: Swift tests with the V1 test dictionary"
+        # tests/SudachiSwiftTests, end-to-end tests included, as in
+        # build.yml's test job. The consumer fixture step checked that the
+        # XCFramework is at the repo root.
+        run: SUDACHI_DICT_PATH="$RUNNER_TEMP/dict-v1/system.dic" swift test
+
       - name: "Smoke test: legacy V0 dictionary is rejected"
         # As in build.yml: Tokenizer.create must throw the "legacy V0" error
         # (the fixture exits non-zero otherwise). If upstream stops serving

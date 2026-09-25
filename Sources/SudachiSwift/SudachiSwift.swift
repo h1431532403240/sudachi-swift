@@ -302,11 +302,26 @@ public enum SudachiDictionaryStore {
     /// legacy-V0 error; a V0 file is preferred over an unreadable one for that
     /// reason). Returns `nil` when nothing matches.
     public static func findDictionary(in additionalPaths: [URL] = []) -> URL? {
+        findDictionary(searching: searchPaths(additional: additionalPaths))
+    }
+
+    /// The directories ``findDictionary(in:)`` searches, in order:
+    /// `additionalPaths`, ``defaultDirectory``, then `Bundle.main.resourceURL`.
+    /// Internal so tests can check the order.
+    static func searchPaths(additional additionalPaths: [URL]) -> [URL] {
         var paths = additionalPaths
         paths.append(defaultDirectory)
         if let bundleURL = Bundle.main.resourceURL {
             paths.append(bundleURL)
         }
+        return paths
+    }
+
+    /// The search behind ``findDictionary(in:)``, over exactly `paths` (no
+    /// ``defaultDirectory`` or main bundle appended). Internal so tests can
+    /// check the search rules without depending on the files of the machine
+    /// they run on.
+    static func findDictionary(searching paths: [URL]) -> URL? {
         let filenames = ["system.dic"] + SudachiDictDistribution.allCases.map(\.dicFilename)
         var legacyFallback: URL?
         var otherFallback: URL?
