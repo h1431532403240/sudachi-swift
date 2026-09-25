@@ -119,12 +119,17 @@ CARGO_SWIFT_PKG="rust/SudachiSwift"
 echo "==> Building XCFramework + UniFFI bindings (platforms: $PLATFORMS, profile: $PROFILE, rust: $toolchain_desc)"
 rm -rf "$CARGO_SWIFT_PKG"
 
-# cargo-swift 0.11.1 marks --xcframework-name as deprecated (the name will be
-# derived from the FFI module name in uniffi.toml), but still honours it; the
-# RustFramework.xcframework path below depends on it. Bumping
-# CARGO_SWIFT_VERSION requires re-checking the output layout (both
-# GENERATED_* paths and the slice names above) before relying on this script.
-cargo_args=(--name SudachiSwift --xcframework-name RustFramework --skip-toolchains-check -y)
+# No --xcframework-name: cargo-swift 0.11.1 deprecates it and names the
+# XCFramework after the FFI module instead (sudachi_swiftFFI, UniFFI's
+# default for this crate; there is no rust/uniffi.toml to change it). The
+# name only matters inside $CARGO_SWIFT_PKG, and the script finds the one
+# .xcframework there rather than repeating it: the XCFramework is staged as
+# SudachiSwift.xcframework, and the module the bindings import is declared by
+# the modulemap inside it, not by its file name.
+# Bumping CARGO_SWIFT_VERSION requires re-checking the output layout (the
+# bindings path and the .xcframework lookup below, and the slice names above)
+# before relying on this script.
+cargo_args=(--name SudachiSwift --skip-toolchains-check -y)
 # No effect unless tvos is requested (see above).
 cargo_args+=(--exclude-arch x86_64-apple-tvos)
 [ "$PROFILE" = "release" ] && cargo_args+=(--release)
@@ -139,10 +144,19 @@ echo "==> cargo swift package ${cargo_args[*]}"
 )
 
 GENERATED_BINDINGS="$CARGO_SWIFT_PKG/Sources/SudachiSwift/sudachi_swift.swift"
-GENERATED_XCFRAMEWORK="$CARGO_SWIFT_PKG/RustFramework.xcframework"
+# The XCFramework cargo-swift just wrote, whatever its name (see above).
+# $CARGO_SWIFT_PKG was removed before the build, so no stale one can match.
+generated_xcframeworks=()
+for d in "$CARGO_SWIFT_PKG"/*.xcframework; do
+    if [ -d "$d" ]; then
+        generated_xcframeworks+=("$d")
+    fi
+done
+GENERATED_XCFRAMEWORK="${generated_xcframeworks[0]:-}"
 
-if [ ! -f "$GENERATED_BINDINGS" ] || [ ! -f "$GENERATED_XCFRAMEWORK/Info.plist" ]; then
-    echo "error: cargo-swift did not produce the expected layout."
+if [ ! -f "$GENERATED_BINDINGS" ] || [ "${#generated_xcframeworks[@]}" -ne 1 ] \
+    || [ ! -f "$GENERATED_XCFRAMEWORK/Info.plist" ]; then
+    echo "error: cargo-swift did not produce the expected layout (the Swift bindings and exactly one .xcframework in $CARGO_SWIFT_PKG)."
     echo "  cargo-swift version: $(cargo swift --version 2>&1 || echo '?')"
     echo "  contents of $CARGO_SWIFT_PKG:"
     find "$CARGO_SWIFT_PKG" -maxdepth 4 2>&1 || echo "  (missing)"
