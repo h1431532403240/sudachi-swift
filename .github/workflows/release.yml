@@ -75,10 +75,12 @@ jobs:
       # third-party code) and recomputes the checksum itself.
       version: ${{ steps.validate.outputs.version }}
     env:
-      # Smoke-test dictionaries: the same pins as build.yml's test job (keep
-      # the three values in sync with it).
+      # Smoke-test dictionaries: the same pins as build.yml's test job (V1
+      # full, legacy V0 small; keep the three values in sync with it). To
+      # bump the dictionary, change the version and both sha256 values
+      # together.
       SUDACHI_DICT_VERSION: "20260723"
-      SUDACHI_DICT_V1_SHA256: f7778a7945ea653154fd61636ad42365f797cddf04123953c1fae1e897cd3b59
+      SUDACHI_DICT_V1_FULL_SHA256: eb6d02206e93f1b62508c9f2d4d4940d6f82c7f63c630bc0c1c4f9c50b7e871e
       SUDACHI_DICT_V0_SHA256: 4729d134fd0b9852dacc89c59229664fee40642bb52bafcf4efb432cee9bb22c
 
     steps:
@@ -200,11 +202,16 @@ jobs:
           swift run Verify
 
       - name: "Smoke test: BasicUsage with the V1 test dictionary"
-        # Upstream's script checks the zip's sha256 and writes ./system.dic.
+        # scripts/fetch-test-dictionary.sh checks the zip's sha256 and
+        # extracts the .dic. Unlike build.yml, this job doesn't restore the
+        # dictionary cache, so the script always downloads (once per
+        # release): actions/cache unpacks an entry relative to the workspace
+        # and can write outside its `path`, and caches on main can be written
+        # by jobs that run unreviewed code (see the rust-cache note above), so
+        # a planted entry could change the XCFramework before it is zipped.
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/dict-v1"
-          (cd "$RUNNER_TEMP/dict-v1" && sh "$GITHUB_WORKSPACE/sudachi.rs/fetch_dictionary.sh" "$SUDACHI_DICT_VERSION" small v1 "$SUDACHI_DICT_V1_SHA256")
+          ./scripts/fetch-test-dictionary.sh "$SUDACHI_DICT_VERSION" full v1 "$SUDACHI_DICT_V1_FULL_SHA256" "$RUNNER_TEMP/sudachidict-zips" "$RUNNER_TEMP/dict-v1/system.dic"
           cd Examples/BasicUsage
           SUDACHI_DICT_PATH="$RUNNER_TEMP/dict-v1/system.dic" swift run BasicUsage
 
@@ -220,8 +227,7 @@ jobs:
         # the V0 fixture, skip with a warning rather than block the release.
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/dict-v0"
-          if ! (cd "$RUNNER_TEMP/dict-v0" && sh "$GITHUB_WORKSPACE/sudachi.rs/fetch_dictionary.sh" "$SUDACHI_DICT_VERSION" small v0 "$SUDACHI_DICT_V0_SHA256"); then
+          if ! ./scripts/fetch-test-dictionary.sh "$SUDACHI_DICT_VERSION" small v0 "$SUDACHI_DICT_V0_SHA256" "$RUNNER_TEMP/sudachidict-zips" "$RUNNER_TEMP/dict-v0/system.dic"; then
             echo "::warning::Could not fetch the V0 fixture dictionary; skipping the legacy-format check."
             exit 0
           fi

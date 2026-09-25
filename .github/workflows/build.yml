@@ -218,22 +218,29 @@ jobs:
     runs-on: macos-15
     needs: build
     env:
-      # Test dictionary, pinned by version + sha256 so a new SudachiDict upload
-      # can't change or break CI; bump all three values together.
-      # sudachi.rs 0.7+ reads only V1-format dictionaries, so the fixture must
-      # come from the V1 CDN path (the "v1" argument to fetch_dictionary.sh).
+      # Test dictionaries, pinned by version + sha256 so a new SudachiDict
+      # upload can't change or break CI. To bump the dictionary, change the
+      # version and both sha256 values together (here and in release.yml);
+      # the cache keys below are built from them, so they change by themselves.
+      # sudachi.rs 0.7+ reads only V1-format dictionaries, so the test
+      # dictionary comes from the V1 CDN path (the "v1" argument to
+      # scripts/fetch-test-dictionary.sh). It is the full one (the largest
+      # vocabulary, so the end-to-end tests see more of what apps load,
+      # e.g. morphemes that split into subunits); its 137 MB zip is cached.
       # (The old job looked up SudachiDict's latest GitHub release, but those
       # releases no longer carry the dictionary zips.)
       SUDACHI_DICT_VERSION: "20260723"
-      SUDACHI_DICT_V1_SHA256: f7778a7945ea653154fd61636ad42365f797cddf04123953c1fae1e897cd3b59
-      # Legacy V0 build of the same release, used only to check it is rejected.
+      SUDACHI_DICT_V1_FULL_SHA256: eb6d02206e93f1b62508c9f2d4d4940d6f82c7f63c630bc0c1c4f9c50b7e871e
+      # Legacy V0 build of the same release, used only to check it is
+      # rejected, so the small one is enough.
       SUDACHI_DICT_V0_SHA256: 4729d134fd0b9852dacc89c59229664fee40642bb52bafcf4efb432cee9bb22c
 
     steps:
+      # No submodules: this job builds no Rust (the XCFramework comes from
+      # the build job), and scripts/fetch-test-dictionary.sh replaced
+      # sudachi.rs/fetch_dictionary.sh.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Also provides sudachi.rs/fetch_dictionary.sh.
-          submodules: recursive
           persist-credentials: false # nothing below uses git credentials
 
       - name: Download XCFramework artifact
@@ -259,11 +266,103 @@ jobs:
             exit 1
           fi
 
-      - name: Download test dictionary (V1)
-        # Upstream's script downloads the zip, checks its sha256, and writes
-        # ./system.dic at the repo root, where SUDACHI_DICT_PATH points for
-        # the Swift tests and BasicUsage.
-        run: sh sudachi.rs/fetch_dictionary.sh "$SUDACHI_DICT_VERSION" small v1 "$SUDACHI_DICT_V1_SHA256"
+      # The dictionary zips (V1 full, 137 MB; V0 small, 42 MB) are cached
+      # between runs, one entry per zip. An entry never changes once saved
+      # (a run that restores it doesn't save it again), so a shared entry
+      # saved while one zip was missing would stay without it; with separate
+      # entries, each zip is saved only once it has been verified, and a
+      # missing one is simply tried again on the next run. Each key holds the
+      # runner OS, the dictionary version and that zip's sha256 pin, so a
+      # changed pin starts a new entry for that zip only. It also holds the
+      # hash of scripts/fetch-test-dictionary.sh, which decides where under
+      # CACHE_DIR the zip goes: an entry saved by an older script could hold
+      # it where the current one doesn't look, and as a restored entry is
+      # never saved again, every run would download the zip. Any change to
+      # the script starts new entries, at the cost of one download per zip.
+      # No restore-keys: an older entry holds an older zip, which the save
+      # step would only carry along into the new entry.
+      # Entries saved on main can be restored on every branch (PRs, and the
+      # check-upstream bump branches that dispatch this workflow); entries
+      # saved on another branch only there. GitHub evicts entries that go
+      # unused for 7 days.
+      # A restored zip gets no more trust than a download: the fetch script
+      # checks its sha256 either way. (release.yml doesn't use this cache;
+      # see the note there.)
+      - name: Restore the cached V1 test dictionary
+        id: dict-v1-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Outside the workspace, where fetch-test-dictionary.sh keeps V1
+          # zips (CACHE_DIR/v1). The save step must use the same path: it is
+          # part of what an entry is matched on.
+          path: ${{ runner.temp }}/sudachidict-zips/v1
+          key: sudachidict-${{ runner.os }}-${{ env.SUDACHI_DICT_VERSION }}-v1-full-${{ env.SUDACHI_DICT_V1_FULL_SHA256 }}-${{ hashFiles('scripts/fetch-test-dictionary.sh') }}
+
+      - name: Fetch the V1 test dictionary
+        # V1 full -> ./system.dic at the repo root, where SUDACHI_DICT_PATH
+        # points for the Swift tests and BasicUsage. The script downloads the
+        # zip only when the cache didn't have it, and fails on a sha256
+        # mismatch, cached or not.
+        run: ./scripts/fetch-test-dictionary.sh "$SUDACHI_DICT_VERSION" full v1 "$SUDACHI_DICT_V1_FULL_SHA256" "$RUNNER_TEMP/sudachidict-zips" "$GITHUB_WORKSPACE/system.dic"
+
+      - name: Save the V1 test dictionary to the cache
+        # Right after the fetch, so a failing test below doesn't cost the next
+        # run the download. Only on a miss (an existing entry is never
+        # replaced), and only with a verified zip: this step doesn't run when
+        # the fetch step failed.
+        if: steps.dict-v1-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sudachidict-zips/v1
+          key: ${{ steps.dict-v1-cache.outputs.cache-primary-key }}
+
+      - name: Restore the cached V0 test dictionary
+        id: dict-v0-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # CACHE_DIR/v0; as for V1, the save step must use the same path.
+          path: ${{ runner.temp }}/sudachidict-zips/v0
+          key: sudachidict-${{ runner.os }}-${{ env.SUDACHI_DICT_VERSION }}-v0-small-${{ env.SUDACHI_DICT_V0_SHA256 }}-${{ hashFiles('scripts/fetch-test-dictionary.sh') }}
+
+      - name: Fetch the V0 test dictionary
+        id: dict-v0
+        # Legacy V0 small -> dict-v0/system.dic for the rejection check.
+        # If upstream stops serving the V0 fixture (the script exits 1), skip
+        # that check with a warning instead of failing CI for an unrelated
+        # reason; nothing is cached then, so the next run tries again.
+        # A cached zip that fails its sha256 check (exit 3) fails the job
+        # instead: every run restores the same entry, so a warning would skip
+        # the check for good.
+        env:
+          DICT_V0_CACHE_KEY: ${{ steps.dict-v0-cache.outputs.cache-primary-key }}
+        run: |
+          set -euo pipefail
+          status=0
+          ./scripts/fetch-test-dictionary.sh "$SUDACHI_DICT_VERSION" small v0 "$SUDACHI_DICT_V0_SHA256" "$RUNNER_TEMP/sudachidict-zips" "$GITHUB_WORKSPACE/dict-v0/system.dic" || status=$?
+          case "$status" in
+            0)
+              echo "fetched=true" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "::warning::Could not fetch the V0 fixture dictionary; skipping the legacy-format check."
+              ;;
+            3)
+              echo "::error::The cached V0 fixture zip doesn't match SUDACHI_DICT_V0_SHA256. Delete the cache entry (gh cache delete '$DICT_V0_CACHE_KEY') and run again."
+              exit 1
+              ;;
+            *)
+              echo "::error::scripts/fetch-test-dictionary.sh exited with $status."
+              exit 1
+              ;;
+          esac
+
+      - name: Save the V0 test dictionary to the cache
+        # Only on a miss, and only when the fetch step verified the zip.
+        if: steps.dict-v0-cache.outputs.cache-hit != 'true' && steps.dict-v0.outputs.fetched == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sudachidict-zips/v0
+          key: ${{ steps.dict-v0-cache.outputs.cache-primary-key }}
 
       - name: Run Swift tests with the test dictionary
         # The build job's suite again, this time including the end-to-end
@@ -285,14 +384,11 @@ jobs:
         # exits non-zero unless the error says "uses the legacy V0 format", or
         # if one of its dictionary-free checks, also run in the build job,
         # fails against this artifact).
-        # If upstream stops serving the V0 fixture, skip with a warning instead
-        # of failing CI for an unrelated reason.
+        # Skipped when "Fetch the V0 test dictionary" couldn't get the V0
+        # fixture (it left a warning).
+        if: steps.dict-v0.outputs.fetched == 'true'
         run: |
-          mkdir -p dict-v0
-          if ! (cd dict-v0 && sh ../sudachi.rs/fetch_dictionary.sh "$SUDACHI_DICT_VERSION" small v0 "$SUDACHI_DICT_V0_SHA256"); then
-            echo "::warning::Could not fetch the V0 fixture dictionary; skipping the legacy-format check."
-            exit 0
-          fi
+          set -euo pipefail
           cd Examples/BasicUsage
           status=0
           SUDACHI_DICT_PATH="../../dict-v0/system.dic" swift run BasicUsage > ../../v0-run.log 2>&1 || status=$?
@@ -311,3 +407,4 @@ jobs:
           # above) and fails the step unless Tokenizer.create throws the V0 error.
           cd "$GITHUB_WORKSPACE/tests/spm-consumer"
           SUDACHI_V0_DICT_PATH="$GITHUB_WORKSPACE/dict-v0/system.dic" swift run Verify
+
