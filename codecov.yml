@@ -23,8 +23,11 @@ codecov:
     manual_trigger: true
 
 # Informational for now: the statuses never fail, so no PR (including the
-# automated sudachi.rs bumps) is blocked on coverage. Tighten later, e.g.
-# `threshold: 1%` on project.
+# automated sudachi.rs bumps) is blocked on coverage.
+# On Codecov's free Developer plan, which this repository uses, Codecov posts
+# only codecov/patch; the project block takes effect only on a plan with
+# project coverage (e.g. Pro). It stays for that case. Tighten later there,
+# e.g. `threshold: 1%` on project.
 coverage:
   status:
     project:
