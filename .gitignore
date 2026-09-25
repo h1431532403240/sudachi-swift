@@ -65,9 +65,10 @@ Examples/*/.swiftpm/
 sudachi-dictionary-*/
 
 # ===================
-# Coverage reports (written by CI's coverage steps in build.yml)
+# Coverage reports and test results (written by CI's test steps in build.yml)
 # ===================
 /coverage/
+/test-results/
 
 # ===================
 # IDE
