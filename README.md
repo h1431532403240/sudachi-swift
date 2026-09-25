@@ -392,6 +392,8 @@ Package.swift                  # Single SPM manifest, used by both external
 scripts/build-local.sh         # Builds XCFramework + stages bindings locally
 scripts/generate-third-party-notices.py
                                # Regenerates THIRD_PARTY_NOTICES.md from rust/Cargo.lock
+scripts/fetch-test-dictionary.sh
+                               # Downloads (or reuses) and verifies CI's test dictionaries
 tests/SudachiSwiftTests/       # XCTest suite for the Swift layer (`swift test`)
 tests/spm-consumer/            # CI fixture that builds the package as an external consumer
 ```
@@ -443,7 +445,7 @@ TEST_RUNNER_SUDACHI_DICT_PATH=/path/to/system.dic xcodebuild test \
   -scheme SudachiSwift -destination 'platform=macOS,variant=Mac Catalyst'
 ```
 
-CI runs the suite in the build job (macOS and Mac Catalyst, without a dictionary) and again in the test job with the pinned dictionary from `build.yml`. The release workflow also runs it, with that dictionary, against the binary it is about to publish.
+CI runs the suite in the build job (macOS and Mac Catalyst, without a dictionary) and again in the test job with the full V1 dictionary, pinned by version and SHA-256 in `build.yml`. The test job caches the dictionary zips between runs (`actions/cache`, one entry per zip, keyed on the version, that zip's SHA-256 pin and the hash of `scripts/fetch-test-dictionary.sh`), and `scripts/fetch-test-dictionary.sh` checks each zip's SHA-256 on every run, whether it came from the cache or was just downloaded. The release workflow also runs the suite, with the same dictionary, against the binary it is about to publish; it downloads the dictionary instead of using the cache (see the note in `release.yml`).
 
 ### Version sync with upstream
 
