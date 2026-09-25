@@ -22,6 +22,11 @@ env:
   # Fail instead of silently installing an unpinned toolchain when something
   # asks rustup for one that isn't installed (e.g. `cargo +stable`).
   RUSTUP_AUTO_INSTALL: "0"
+  # cargo-llvm-cov for the Rust coverage report, pinned like cargo-swift so a
+  # new release can't change CI unannounced (0.9.x needs rustc 1.87+).
+  # Swatinem/rust-cache hashes CARGO_* variables into its key, so bumping
+  # this starts a fresh cache that holds the new binary.
+  CARGO_LLVM_COV_VERSION: "0.9.1"
 
 jobs:
   build:
@@ -47,12 +52,16 @@ jobs:
           # No x86_64-apple-tvos: it is Tier 3, so the tvOS Simulator slice is
           # arm64 only, like visionOS's.
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi,aarch64-apple-tvos,aarch64-apple-tvos-sim,aarch64-apple-visionos,aarch64-apple-visionos-sim
+          # llvm-cov and llvm-profdata matching this rustc, for cargo-llvm-cov.
+          # Installed here because RUSTUP_AUTO_INSTALL=0 stops anything from
+          # fetching it later.
+          components: llvm-tools-preview
 
       - name: Cache Rust dependencies
-        # Runs before the cargo-swift install: rust-cache leaves out anything
-        # already in ~/.cargo/bin when it starts, so this order lets the pinned
-        # cargo-swift be cached, and on later runs `cargo install` finds it
-        # already installed.
+        # Runs before the cargo-swift and cargo-llvm-cov installs: rust-cache
+        # leaves out anything already in ~/.cargo/bin when it starts, so this
+        # order lets the pinned tools be cached, and on later runs
+        # `cargo install` finds them already installed.
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: rust
@@ -66,12 +75,48 @@ jobs:
           fi
           cargo install cargo-swift --version "$CARGO_SWIFT_VERSION" --locked
 
-      - name: Run Rust unit tests
-        # Includes dictionary-format detection tests, which read
-        # sudachi.rs/sudachi/tests/resources from the submodule. --locked:
-        # rust/Cargo.lock is tracked, so CI fails instead of silently resolving
-        # different dependency versions.
-        run: cargo test --locked --manifest-path rust/Cargo.toml
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked
+
+      - name: Run Rust unit tests (with coverage)
+        # The tests in rust/src/tests.rs, including dictionary-format
+        # detection tests that read sudachi.rs/sudachi/tests/resources from
+        # the submodule. cargo llvm-cov builds them with coverage
+        # instrumentation (in its own target dir) and fails the step if a
+        # test fails, like `cargo test`. --locked: rust/Cargo.lock is tracked,
+        # so CI fails instead of silently resolving different dependency
+        # versions.
+        # The report covers rust/src/lib.rs only: sudachi.rs is not a member
+        # of this workspace, and cargo-llvm-cov leaves out files named
+        # tests.rs. The coverage job uploads coverage/rust.lcov to Codecov;
+        # the table on the run's summary page needs no third party.
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/coverage"
+          cargo llvm-cov --locked --no-report
+          cargo llvm-cov report --locked --lcov --output-path "$GITHUB_WORKSPACE/coverage/rust.lcov"
+          # llvm-cov writes absolute paths; Codecov matches repo-relative
+          # ones (rust/src/lib.rs) against the repository without `fixes:`.
+          perl -pi -e 's#^SF:\Q$ENV{GITHUB_WORKSPACE}\E/#SF:#' "$GITHUB_WORKSPACE/coverage/rust.lcov"
+          if grep -q '^SF:/' "$GITHUB_WORKSPACE/coverage/rust.lcov"; then
+            echo "::error::coverage/rust.lcov still has absolute paths outside $GITHUB_WORKSPACE:"
+            grep '^SF:/' "$GITHUB_WORKSPACE/coverage/rust.lcov"
+            exit 1
+          fi
+          {
+            echo '### Rust coverage (cargo llvm-cov)'
+            echo '```'
+            cargo llvm-cov report --locked
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Rust coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-rust
+          path: coverage/rust.lcov
+          if-no-files-found: error
 
       - name: Build XCFramework + stage bindings (all platforms)
         run: ./scripts/build-local.sh
@@ -364,12 +409,59 @@ jobs:
           path: ${{ runner.temp }}/sudachidict-zips/v0
           key: ${{ steps.dict-v0-cache.outputs.cache-primary-key }}
 
-      - name: Run Swift tests with the test dictionary
+      - name: Run Swift tests with the test dictionary (with coverage)
         # The build job's suite again, this time including the end-to-end
         # tests, which load the real dictionary from SUDACHI_DICT_PATH (and
         # fail, not skip, if it isn't a V1 file). Uses this build's XCFramework
         # (checked above) and bindings.
-        run: SUDACHI_DICT_PATH="$GITHUB_WORKSPACE/system.dic" swift test
+        # Coverage covers the hand-written Swift layer only: the XCFramework
+        # is a release build without coverage instrumentation, and the
+        # generated bindings (sudachi_swift.swift) are left out. The coverage
+        # job uploads coverage/swift.lcov to Codecov; the table on the run's
+        # summary page needs no third party.
+        env:
+          SUDACHI_DICT_PATH: ${{ github.workspace }}/system.dic
+        run: |
+          set -euo pipefail
+          swift test --enable-code-coverage
+          # Where SwiftPM keeps the merged profile and the test bundle depends
+          # on the toolchain (.build/arm64-apple-macosx/debug and
+          # SudachiSwiftPackageTests.xctest with Swift 6.1;
+          # .build/out/Products/Debug and SudachiSwiftTests.xctest with 6.4),
+          # so ask SwiftPM instead of hard-coding them.
+          profdata="$(dirname "$(swift test --enable-code-coverage --show-codecov-path)")/default.profdata"
+          bundles=("$(swift build --show-bin-path)"/*.xctest)
+          if [ "${#bundles[@]}" -ne 1 ] || [ ! -d "${bundles[0]}" ] || [ ! -f "$profdata" ]; then
+            echo "::error::Expected one .xctest bundle and $profdata; found: ${bundles[*]}"
+            exit 1
+          fi
+          binary="${bundles[0]}/Contents/MacOS/$(basename "${bundles[0]}" .xctest)"
+          # Files under Sources/SudachiSwift only (not the tests or .build's
+          # generated accessors), minus the generated bindings.
+          llvm_cov_args=(-instr-profile "$profdata" "$binary" -ignore-filename-regex '/sudachi_swift\.swift$' "$GITHUB_WORKSPACE/Sources/SudachiSwift")
+          mkdir -p coverage
+          xcrun llvm-cov export -format=lcov "${llvm_cov_args[@]}" > coverage/swift.lcov
+          # Repo-relative paths (Sources/SudachiSwift/SudachiSwift.swift), as
+          # for the Rust report.
+          perl -pi -e 's#^SF:\Q$ENV{GITHUB_WORKSPACE}\E/#SF:#' coverage/swift.lcov
+          if ! grep -q '^SF:' coverage/swift.lcov || grep -q '^SF:/' coverage/swift.lcov; then
+            echo "::error::coverage/swift.lcov lists no files, or absolute paths outside $GITHUB_WORKSPACE:"
+            grep '^SF:' coverage/swift.lcov || true
+            exit 1
+          fi
+          {
+            echo '### Swift coverage (llvm-cov)'
+            echo '```'
+            xcrun llvm-cov report "${llvm_cov_args[@]}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Swift coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-swift
+          path: coverage/swift.lcov
+          if-no-files-found: error
 
       - name: Run BasicUsage example
         run: |
@@ -408,3 +500,97 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/spm-consumer"
           SUDACHI_V0_DICT_PATH="$GITHUB_WORKSPACE/dict-v0/system.dic" swift run Verify
 
+  coverage:
+    # Uploads the lcov reports of the build and test jobs to Codecov, then
+    # tells it to notify (see the last step). The only job with an id-token
+    # (the upload credential), and it runs no project or third-party build
+    # code; build and test keep a read-only token.
+    # Needs a successful build (the Rust report); runs when the test job
+    # failed too, uploading the Swift report only if it exists.
+    needs: [build, test]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # OIDC upload: Codecov accepts a GitHub-signed token for this repo, so
+      # no CODECOV_TOKEN secret is stored. Fork PRs get no id-token; the
+      # action detects them and uploads without a token, which Codecov
+      # accepts from forks of public repositories.
+      id-token: write
+    env:
+      # The action downloads the Codecov CLI at run time ("latest" by
+      # default) and checks its signature; pin it like the other tools, and
+      # bump it together with the action.
+      CODECOV_CLI_VERSION: v11.3.1
+
+    steps:
+      # The CLI reads the commit and the repository's file list from git.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing below uses git credentials
+
+      - name: Download coverage reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-*
+          path: coverage
+          merge-multiple: true
+
+      # fail_ci_if_error: false and continue-on-error, so a Codecov outage
+      # doesn't turn a PR (or an upstream bump) red; the reports stay on each
+      # run's summary page. fail_ci_if_error only covers the action's upload
+      # script, and the action's earlier step that fetches the OIDC token
+      # fails on its own (a GitHub-side hiccup, say), hence continue-on-error
+      # on all three Codecov steps.
+      # disable_search + files + plugins: noop upload exactly these reports,
+      # with repo-relative paths already (see the build and test jobs).
+      - name: Upload Rust coverage to Codecov
+        continue-on-error: true
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: true
+          files: coverage/rust.lcov
+          disable_search: true
+          plugins: noop
+          flags: rust
+          name: rust
+          version: ${{ env.CODECOV_CLI_VERSION }}
+          disable_telem: true
+          fail_ci_if_error: false
+
+      - name: Upload Swift coverage to Codecov
+        if: ${{ hashFiles('coverage/swift.lcov') != '' }}
+        continue-on-error: true
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: true
+          files: coverage/swift.lcov
+          disable_search: true
+          plugins: noop
+          flags: swift
+          name: swift
+          version: ${{ env.CODECOV_CLI_VERSION }}
+          disable_telem: true
+          fail_ci_if_error: false
+
+      # codecov.yml sets `notify: manual_trigger`, so Codecov posts statuses
+      # and the PR comment only when this step says the uploads are done:
+      # once, instead of after the Rust upload and again after the Swift one.
+      # It runs when there was no Swift report, and (!cancelled()) even when
+      # an upload step failed: if it doesn't run, nothing is posted for this
+      # commit. Codecov itself waits for uploads still being processed.
+      # A fork PR has no OIDC token, and unlike uploads this call isn't
+      # accepted without one unless the Codecov org's Global Upload Token
+      # setting is "Not required"; otherwise the PR gets no statuses or
+      # comment (its reports still show on codecov.io).
+      - name: Tell Codecov the uploads are done
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          run_command: send-notifications
+          use_oidc: true
+          version: ${{ env.CODECOV_CLI_VERSION }}
+          disable_telem: true
+          fail_ci_if_error: false

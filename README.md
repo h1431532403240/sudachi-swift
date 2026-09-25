@@ -6,6 +6,7 @@
 [![Swift Package Manager](https://img.shields.io/badge/SPM-compatible-brightgreen)](#installation)
 [![License](https://img.shields.io/github/license/h1431532403240/sudachi-swift)](LICENSE)
 [![Build](https://github.com/h1431532403240/sudachi-swift/actions/workflows/build.yml/badge.svg)](https://github.com/h1431532403240/sudachi-swift/actions/workflows/build.yml)
+[![Coverage](https://codecov.io/gh/h1431532403240/sudachi-swift/graph/badge.svg)](https://codecov.io/gh/h1431532403240/sudachi-swift)
 
 Swift bindings for [sudachi.rs](https://github.com/WorksApplications/sudachi.rs), a high-performance Japanese morphological analyzer written in Rust.
 
@@ -379,7 +380,9 @@ The project pins the official [sudachi.rs](https://github.com/WorksApplications/
 ```
 rust/                          # Rust UniFFI wrapper crate
 ├── Cargo.toml
-└── src/lib.rs
+└── src/
+    ├── lib.rs
+    └── tests.rs               # Rust unit tests (`cargo test`)
 
 sudachi.rs/                    # git submodule, pinned to an upstream tag
 Sources/SudachiSwift/          # Swift package source
@@ -394,6 +397,7 @@ scripts/generate-third-party-notices.py
                                # Regenerates THIRD_PARTY_NOTICES.md from rust/Cargo.lock
 scripts/fetch-test-dictionary.sh
                                # Downloads (or reuses) and verifies CI's test dictionaries
+codecov.yml                    # Codecov settings for the coverage CI uploads
 tests/SudachiSwiftTests/       # XCTest suite for the Swift layer (`swift test`)
 tests/spm-consumer/            # CI fixture that builds the package as an external consumer
 ```
@@ -411,7 +415,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin \
   aarch64-apple-visionos aarch64-apple-visionos-sim
 cargo install cargo-swift --version 0.11.1 --locked
 
-cargo test --manifest-path rust/Cargo.toml   # Rust wrapper tests (uses the submodule's test dictionaries)
+cargo test --manifest-path rust/Cargo.toml   # Rust wrapper tests in rust/src/tests.rs (use the submodule's test dictionaries)
 ./scripts/build-local.sh                     # produces SudachiSwift.xcframework + sudachi_swift.swift
 swift build
 swift test                                   # Swift tests (see Running the tests)
@@ -446,6 +450,8 @@ TEST_RUNNER_SUDACHI_DICT_PATH=/path/to/system.dic xcodebuild test \
 ```
 
 CI runs the suite in the build job (macOS and Mac Catalyst, without a dictionary) and again in the test job with the full V1 dictionary, pinned by version and SHA-256 in `build.yml`. The test job caches the dictionary zips between runs (`actions/cache`, one entry per zip, keyed on the version, that zip's SHA-256 pin and the hash of `scripts/fetch-test-dictionary.sh`), and `scripts/fetch-test-dictionary.sh` checks each zip's SHA-256 on every run, whether it came from the cache or was just downloaded. The release workflow also runs the suite, with the same dictionary, against the binary it is about to publish; it downloads the dictionary instead of using the cache (see the note in `release.yml`).
+
+The Rust unit tests are in `rust/src/tests.rs`, not in `lib.rs`, so that coverage counts only the wrapper's own code: cargo-llvm-cov leaves files named `tests.rs` out of its report. CI runs them with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov), runs the test job's `swift test` with `--enable-code-coverage`, and uploads both reports to [Codecov](https://codecov.io/gh/h1431532403240/sudachi-swift) (flags `rust` and `swift`, settings in `codecov.yml`); each run's summary page shows the same tables. Codecov posts its statuses and PR comment once per commit, when the coverage job's last step reports the uploads done (`manual_trigger` in `codecov.yml`); on pull requests from forks, that step has no OIDC token, so this happens only if the Codecov account doesn't require upload tokens. The reports cover `rust/src/lib.rs` and `Sources/SudachiSwift/SudachiSwift.swift`. The generated bindings are left out, and the Rust code that the Swift tests reach through the XCFramework isn't measured, because the XCFramework is a release build without coverage instrumentation. For the Rust report locally: `rustup component add llvm-tools-preview`, `cargo install cargo-llvm-cov --version 0.9.1 --locked`, then `cargo llvm-cov` in `rust/`.
 
 ### Version sync with upstream
 
