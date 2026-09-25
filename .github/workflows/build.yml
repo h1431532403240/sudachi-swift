@@ -76,6 +76,23 @@ jobs:
       - name: Build XCFramework + stage bindings (all platforms)
         run: ./scripts/build-local.sh
 
+      - name: Run Swift tests (macOS)
+        # tests/SudachiSwiftTests: the hand-written Swift API, errors and
+        # fields crossing the FFI boundary, bundled resources, dictionary
+        # discovery. Root Package.swift uses ./SudachiSwift.xcframework only if
+        # it exists; otherwise it silently downloads the last published
+        # release, and this would test that binary instead of this build.
+        # The end-to-end tests need SUDACHI_DICT_PATH and skip here; the test
+        # job runs them with the pinned dictionary.
+        run: |
+          set -euo pipefail
+          if [ ! -f SudachiSwift.xcframework/Info.plist ]; then
+            echo "::error::SudachiSwift.xcframework/Info.plist not found at the repo root; build-local.sh's output moved, so the tests would run against the published binary."
+            ls -la . 2>&1 || true
+            exit 1
+          fi
+          swift test
+
       - name: Verify root Package.swift via SPM consumer fixture
         # Builds and runs tests/spm-consumer/ against root Package.swift with a
         # local binaryTarget. Building catches the v0.1.0 class of bug where
@@ -113,6 +130,17 @@ jobs:
           xcodebuild build \
             -scheme SudachiSwift \
             -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            -skipPackagePluginValidation
+
+      - name: Run Swift tests (Mac Catalyst)
+        # The same tests against the Mac Catalyst slice (`swift test` links
+        # the macOS one), with the resource bundle as Xcode builds it. The
+        # SudachiSwift scheme includes the test target. Catalyst runs on the
+        # runner itself, so no simulator is needed.
+        run: |
+          xcodebuild test \
+            -scheme SudachiSwift \
+            -destination 'platform=macOS,variant=Mac Catalyst' \
             -skipPackagePluginValidation
 
       - name: Verify tvOS build
@@ -233,9 +261,16 @@ jobs:
 
       - name: Download test dictionary (V1)
         # Upstream's script downloads the zip, checks its sha256, and writes
-        # ./system.dic at the repo root, where BasicUsage's
-        # SUDACHI_DICT_PATH points.
+        # ./system.dic at the repo root, where SUDACHI_DICT_PATH points for
+        # the Swift tests and BasicUsage.
         run: sh sudachi.rs/fetch_dictionary.sh "$SUDACHI_DICT_VERSION" small v1 "$SUDACHI_DICT_V1_SHA256"
+
+      - name: Run Swift tests with the test dictionary
+        # The build job's suite again, this time including the end-to-end
+        # tests, which load the real dictionary from SUDACHI_DICT_PATH (and
+        # fail, not skip, if it isn't a V1 file). Uses this build's XCFramework
+        # (checked above) and bindings.
+        run: SUDACHI_DICT_PATH="$GITHUB_WORKSPACE/system.dic" swift test
 
       - name: Run BasicUsage example
         run: |

@@ -392,6 +392,7 @@ Package.swift                  # Single SPM manifest, used by both external
 scripts/build-local.sh         # Builds XCFramework + stages bindings locally
 scripts/generate-third-party-notices.py
                                # Regenerates THIRD_PARTY_NOTICES.md from rust/Cargo.lock
+tests/SudachiSwiftTests/       # XCTest suite for the Swift layer (`swift test`)
 tests/spm-consumer/            # CI fixture that builds the package as an external consumer
 ```
 
@@ -411,6 +412,7 @@ cargo install cargo-swift --version 0.11.1 --locked
 cargo test --manifest-path rust/Cargo.toml   # Rust wrapper tests (uses the submodule's test dictionaries)
 ./scripts/build-local.sh                     # produces SudachiSwift.xcframework + sudachi_swift.swift
 swift build
+swift test                                   # Swift tests (see Running the tests)
 cd Examples/BasicUsage && SUDACHI_DICT_PATH=/path/to/system.dic swift run BasicUsage
 ```
 
@@ -421,6 +423,27 @@ Everything builds with stable Rust. The tvOS and visionOS targets need a Rust re
 Regenerate `THIRD_PARTY_NOTICES.md` with `python3 scripts/generate-third-party-notices.py` whenever `rust/Cargo.lock` changes. With `--check`, it exits non-zero if the file is out of date.
 
 The root `Package.swift` auto-detects the local `SudachiSwift.xcframework` and falls back to the published release zip when it's absent, so the same manifest serves both contributors and external SPM users.
+
+SwiftPM caches the evaluated manifest, and that cache doesn't notice the XCFramework appearing. If you ran `swift build` or `swift test` before `build-local.sh`, SwiftPM keeps using the release zip, without a warning. Run `swift package purge-cache` once after the build, or pass `--manifest-cache none` to each `swift build` / `swift test`. `swift package dump-package | grep xcframework` shows which binary is in use: `"path" : "SudachiSwift.xcframework"` for the local build, the release zip's `url` otherwise.
+
+### Running the tests
+
+`swift test` runs `tests/SudachiSwiftTests/`. It covers what this package adds on top of sudachi.rs: the Swift API in `SudachiSwift.swift`, errors and morpheme fields crossing the FFI boundary, the bundled resources, and dictionary discovery. How text is analyzed is sudachi.rs's to test, so the suite doesn't check segmentation results.
+
+Run `./scripts/build-local.sh` first. Without `SudachiSwift.xcframework` at the repo root, `Package.swift` uses the published release binary, and the tests don't see your changes to `rust/`. The same happens when SwiftPM cached the manifest before the XCFramework existed (see the manifest cache note above).
+
+The end-to-end tests load a real V1 dictionary and are skipped unless `SUDACHI_DICT_PATH` gives its absolute path.
+
+```bash
+SUDACHI_DICT_PATH=/path/to/system.dic swift test
+
+# The same tests on Mac Catalyst. xcodebuild passes the dictionary to the
+# tests only with the TEST_RUNNER_ prefix.
+TEST_RUNNER_SUDACHI_DICT_PATH=/path/to/system.dic xcodebuild test \
+  -scheme SudachiSwift -destination 'platform=macOS,variant=Mac Catalyst'
+```
+
+CI runs the suite in the build job (macOS and Mac Catalyst, without a dictionary) and again in the test job with the pinned dictionary from `build.yml`. The release workflow also runs it, with that dictionary, against the binary it is about to publish.
 
 ### Version sync with upstream
 
