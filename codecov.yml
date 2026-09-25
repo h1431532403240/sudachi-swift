@@ -1,15 +1,23 @@
-# Codecov settings. The coverage job in .github/workflows/build.yml uploads
-# two reports: rust/src/lib.rs (flag "rust", from cargo llvm-cov in the build
-# job) and Sources/SudachiSwift/SudachiSwift.swift (flag "swift", from
-# `swift test --enable-code-coverage` in the test job).
+# Codecov settings. The codecov job in .github/workflows/build.yml uploads
+# two coverage reports: rust/src/lib.rs (flag "rust", from cargo llvm-cov in
+# the build job) and Sources/SudachiSwift/SudachiSwift.swift (flag "swift",
+# from `swift test --enable-code-coverage` in the test job). It also uploads
+# the Swift tests' results (JUnit XML, flag "swift") for Test Analytics,
+# which needs no settings here (flaky-test detection is on by default).
 # Check changes before committing:
 #   curl --data-binary @codecov.yml https://codecov.io/validate
 
-# Notify (statuses, PR comment) once per commit, after both uploads: without
-# this, Codecov notifies after the first upload and edits everything after
-# the second. With it, nothing is posted until the coverage job's last step
-# runs the CLI's send-notifications, which it does even when the Swift report
-# is missing. Remove this line together with that step.
+# Notify about coverage (statuses, PR comment) once per commit, after both
+# uploads: without this, Codecov notifies after the first upload and edits
+# everything after the second. With it, coverage notifications wait for the
+# codecov job's last step, the CLI's send-notifications, which it runs even
+# when the Swift report is missing. Remove this line together with that step.
+# Test results don't wait for it: once Codecov has processed them, it posts
+# failed tests to the PR comment (and then sends no coverage statuses or
+# comment for the commit), or, when none failed, sends the coverage
+# notifications by itself, possibly before that step does and from a partial
+# report (a coverage upload not yet processed counts with its carried-forward
+# numbers).
 codecov:
   notify:
     manual_trigger: true
@@ -62,7 +70,9 @@ component_management:
 comment:
   layout: "condensed_header, condensed_files, condensed_footer"
   behavior: default       # edit one comment instead of posting new ones
-  require_changes: true   # stay quiet on PRs that don't change coverage
+  # Stay quiet on PRs that don't change coverage. (Failed tests are posted
+  # to the same comment regardless.)
+  require_changes: true
 
 # Line annotations on the PR diff: Codecov is deprecating them, and they
 # don't work with flags or components anyway.

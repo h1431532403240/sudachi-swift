@@ -88,7 +88,7 @@ jobs:
         # versions.
         # The report covers rust/src/lib.rs only: sudachi.rs is not a member
         # of this workspace, and cargo-llvm-cov leaves out files named
-        # tests.rs. The coverage job uploads coverage/rust.lcov to Codecov;
+        # tests.rs. The codecov job uploads coverage/rust.lcov to Codecov;
         # the table on the run's summary page needs no third party.
         working-directory: rust
         run: |
@@ -133,6 +133,17 @@ jobs:
         # release, and this would test that binary instead of this build.
         # The end-to-end tests need SUDACHI_DICT_PATH and skip here; the test
         # job runs them with the pinned dictionary.
+        # Test results for Codecov Test Analytics (uploaded by the codecov
+        # job): scripts/xctest-junit.py passes the output through and writes
+        # XCTest's results to test-results/swift-macos.xml, also when a test
+        # fails, with the run after each test's name ("testFoo (macOS)"):
+        # otherwise Codecov would count a test's runs here, in the Mac
+        # Catalyst step and in the test job as one, with one outcome. Not
+        # `swift test --xunit-output`: without --parallel it writes no XCTest
+        # results (the script explains). The step's result is the tests'
+        # own: if XCTest's output stops matching what the script reads (no
+        # results, or a count that disagrees with XCTest's totals), it only
+        # warns, like the Codecov steps never turn CI red.
         run: |
           set -euo pipefail
           if [ ! -f SudachiSwift.xcframework/Info.plist ]; then
@@ -140,7 +151,7 @@ jobs:
             ls -la . 2>&1 || true
             exit 1
           fi
-          swift test
+          python3 scripts/xctest-junit.py --run macOS test-results/swift-macos.xml -- swift test
 
       - name: Verify root Package.swift via SPM consumer fixture
         # Builds and runs tests/spm-consumer/ against root Package.swift with a
@@ -190,11 +201,27 @@ jobs:
         # the native one instead of letting xcodebuild pick the first match
         # (with a "multiple matching destinations" warning). The generic
         # "Verify Mac Catalyst build" step above builds both architectures.
+        # xcodebuild prints the same XCTest lines as `swift test`, so the
+        # results go to test-results/swift-catalyst.xml the same way.
         run: |
-          xcodebuild test \
-            -scheme SudachiSwift \
-            -destination 'platform=macOS,variant=Mac Catalyst,arch=arm64' \
-            -skipPackagePluginValidation
+          set -euo pipefail
+          python3 scripts/xctest-junit.py --run 'Mac Catalyst' test-results/swift-catalyst.xml -- \
+            xcodebuild test \
+              -scheme SudachiSwift \
+              -destination 'platform=macOS,variant=Mac Catalyst,arch=arm64' \
+              -skipPackagePluginValidation
+
+      - name: Upload test results
+        # For the codecov job. Also after a failed test step: failures are
+        # what Test Analytics is for. A report is missing only when its step
+        # never got to run the tests (one that ran them and wrote no report
+        # fails), and that step's error already says so: ignore, don't warn.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-build
+          path: test-results/*.xml
+          if-no-files-found: ignore
 
       - name: Verify tvOS build
         run: |
@@ -424,14 +451,17 @@ jobs:
         # (checked above) and bindings.
         # Coverage covers the hand-written Swift layer only: the XCFramework
         # is a release build without coverage instrumentation, and the
-        # generated bindings (sudachi_swift.swift) are left out. The coverage
+        # generated bindings (sudachi_swift.swift) are left out. The codecov
         # job uploads coverage/swift.lcov to Codecov; the table on the run's
         # summary page needs no third party.
+        # Test results go to test-results/swift-macos-with-dictionary.xml, as
+        # in the build job ("Run Swift tests (macOS)" explains).
         env:
           SUDACHI_DICT_PATH: ${{ github.workspace }}/system.dic
         run: |
           set -euo pipefail
-          swift test --enable-code-coverage
+          python3 scripts/xctest-junit.py --run 'macOS with dictionary' test-results/swift-macos-with-dictionary.xml -- \
+            swift test --enable-code-coverage
           # Where SwiftPM keeps the merged profile and the test bundle depends
           # on the toolchain (.build/arm64-apple-macosx/debug and
           # SudachiSwiftPackageTests.xctest with Swift 6.1;
@@ -474,6 +504,16 @@ jobs:
           path: coverage/swift.lcov
           if-no-files-found: error
 
+      - name: Upload test results
+        # As in the build job: also when the tests failed, and nothing to
+        # add when an earlier step kept them from running.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-test
+          path: test-results/*.xml
+          if-no-files-found: ignore
+
       - name: Run BasicUsage example
         run: |
           cd Examples/BasicUsage
@@ -511,15 +551,17 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/spm-consumer"
           SUDACHI_V0_DICT_PATH="$GITHUB_WORKSPACE/dict-v0/system.dic" swift run Verify
 
-  coverage:
-    # Uploads the lcov reports of the build and test jobs to Codecov, then
-    # tells it to notify (see the last step). The only job with an id-token
-    # (the upload credential), and it runs no project or third-party build
-    # code; build and test keep a read-only token.
-    # Needs a successful build (the Rust report); runs when the test job
-    # failed too, uploading the Swift report only if it exists.
+  codecov:
+    # Uploads the build and test jobs' coverage reports (lcov) and test
+    # results (JUnit XML) to Codecov, then tells it the uploads are done (see
+    # the last step). The only job with an id-token (the upload credential),
+    # and it runs no project or third-party build code; build and test keep a
+    # read-only token.
+    # Runs when build or test failed too: failed tests are what Test
+    # Analytics reports. A job that failed early leaves some files out, so
+    # each upload step runs only if its file is there.
     needs: [build, test]
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -541,6 +583,8 @@ jobs:
         with:
           persist-credentials: false # nothing below uses git credentials
 
+      # By pattern, not name: an artifact that a failed job never uploaded
+      # then simply matches nothing, where a missing name fails the step.
       - name: Download coverage reports
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -548,15 +592,25 @@ jobs:
           path: coverage
           merge-multiple: true
 
+      - name: Download test results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: test-results-*
+          path: test-results
+          merge-multiple: true
+
       # fail_ci_if_error: false and continue-on-error, so a Codecov outage
       # doesn't turn a PR (or an upstream bump) red; the reports stay on each
       # run's summary page. fail_ci_if_error only covers the action's upload
       # script, and the action's earlier step that fetches the OIDC token
       # fails on its own (a GitHub-side hiccup, say), hence continue-on-error
-      # on all three Codecov steps.
+      # on every Codecov step.
+      # Each upload runs if its file is there (!cancelled(): whatever failed
+      # before it), so one missing report doesn't hold back the others.
       # disable_search + files + plugins: noop upload exactly these reports,
       # with repo-relative paths already (see the build and test jobs).
       - name: Upload Rust coverage to Codecov
+        if: ${{ !cancelled() && hashFiles('coverage/rust.lcov') != '' }}
         continue-on-error: true
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -571,7 +625,7 @@ jobs:
           fail_ci_if_error: false
 
       - name: Upload Swift coverage to Codecov
-        if: ${{ hashFiles('coverage/swift.lcov') != '' }}
+        if: ${{ !cancelled() && hashFiles('coverage/swift.lcov') != '' }}
         continue-on-error: true
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -585,18 +639,54 @@ jobs:
           disable_telem: true
           fail_ci_if_error: false
 
-      # codecov.yml sets `notify: manual_trigger`, so Codecov posts statuses
-      # and the PR comment only when this step says the uploads are done:
-      # once, instead of after the Rust upload and again after the Swift one.
-      # It runs when there was no Swift report, and (!cancelled()) even when
-      # an upload step failed: if it doesn't run, nothing is posted for this
-      # commit. Codecov itself waits for uploads still being processed.
+      # Test Analytics: the Tests tab (failure rates, flaky tests, slowest
+      # tests) and failed tests in the PR comment. Uploads every report in
+      # test-results/ (the files input takes a glob), one per Swift test run
+      # (see the build job). No plugins run for test results, so no
+      # `plugins: noop`. Flag swift, like the coverage of the same code:
+      # Codecov keeps one list of flags per repository, so a flag per test
+      # run would show up among the coverage flags too. (Flags don't tell
+      # the runs apart anyway; the run in each test's name does.)
+      # Test results go to an endpoint of their own, which takes the OIDC
+      # token as well and, like the coverage uploads, a fork PR's upload
+      # without one. Nor do they wait for the next step: once Codecov has
+      # processed them, it comments on failed tests by itself (and then
+      # sends no coverage statuses or comment for the commit), so fork PRs
+      # get that comment too. Uploaded before the next step all the same, so
+      # that the "uploads done" call comes after every upload and Codecov
+      # likely knows about failed tests by the time it would notify about
+      # coverage.
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && hashFiles('test-results/*.xml') != '' }}
+        continue-on-error: true
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          report_type: test_results
+          use_oidc: true
+          files: test-results/*.xml
+          disable_search: true
+          flags: swift
+          version: ${{ env.CODECOV_CLI_VERSION }}
+          disable_telem: true
+          fail_ci_if_error: false
+
+      # codecov.yml sets `notify: manual_trigger`, so Codecov posts the
+      # coverage statuses and PR comment when this step says the uploads are
+      # done, instead of after the Rust upload and again after the Swift one
+      # (test results with no failures can prompt them too; see codecov.yml).
+      # It runs when a report is missing, and (!cancelled()) even when an
+      # upload step failed: if it doesn't run, coverage statuses and comment
+      # come only from passing test results, if at all. Codecov itself waits
+      # for uploads still being processed. Skipped only when there was
+      # nothing to upload (Codecov would answer that it found no uploads).
       # A fork PR has no OIDC token, and unlike uploads this call isn't
       # accepted without one unless the Codecov org's Global Upload Token
-      # setting is "Not required"; otherwise the PR gets no statuses or
-      # comment (its reports still show on codecov.io).
+      # setting is "Not required". Otherwise the PR gets coverage statuses
+      # and comment only when Codecov sends them after passing test results,
+      # which it skips if a coverage upload is being processed at that
+      # moment (the reports still show on codecov.io).
       - name: Tell Codecov the uploads are done
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && hashFiles('coverage/*.lcov', 'test-results/*.xml') != '' }}
         continue-on-error: true
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
