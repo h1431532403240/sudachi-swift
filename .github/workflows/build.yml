@@ -104,10 +104,14 @@ jobs:
             grep '^SF:/' "$GITHUB_WORKSPACE/coverage/rust.lcov"
             exit 1
           fi
+          # The table goes to the log and to the summary page. (set -e: a
+          # failing report fails the step at the assignment.)
+          report="$(cargo llvm-cov report --locked)"
+          echo "$report"
           {
             echo '### Rust coverage (cargo llvm-cov)'
             echo '```'
-            cargo llvm-cov report --locked
+            echo "$report"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -181,11 +185,15 @@ jobs:
         # The same tests against the Mac Catalyst slice (`swift test` links
         # the macOS one), with the resource bundle as Xcode builds it. The
         # SudachiSwift scheme includes the test target. Catalyst runs on the
-        # runner itself, so no simulator is needed.
+        # runner itself, so no simulator is needed. The arm64 runner matches
+        # both an arm64 and an x86_64 (Rosetta) Catalyst destination, so name
+        # the native one instead of letting xcodebuild pick the first match
+        # (with a "multiple matching destinations" warning). The generic
+        # "Verify Mac Catalyst build" step above builds both architectures.
         run: |
           xcodebuild test \
             -scheme SudachiSwift \
-            -destination 'platform=macOS,variant=Mac Catalyst' \
+            -destination 'platform=macOS,variant=Mac Catalyst,arch=arm64' \
             -skipPackagePluginValidation
 
       - name: Verify tvOS build
@@ -436,6 +444,9 @@ jobs:
             exit 1
           fi
           binary="${bundles[0]}/Contents/MacOS/$(basename "${bundles[0]}" .xctest)"
+          # In the log, so a toolchain layout change shows up without a rerun.
+          echo "Coverage profile: $profdata"
+          echo "Test binary: $binary"
           # Files under Sources/SudachiSwift only (not the tests or .build's
           # generated accessors), minus the generated bindings.
           llvm_cov_args=(-instr-profile "$profdata" "$binary" -ignore-filename-regex '/sudachi_swift\.swift$' "$GITHUB_WORKSPACE/Sources/SudachiSwift")
