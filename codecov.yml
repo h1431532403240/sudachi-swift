@@ -1,0 +1,70 @@
+# Codecov settings. The coverage job in .github/workflows/build.yml uploads
+# two reports: rust/src/lib.rs (flag "rust", from cargo llvm-cov in the build
+# job) and Sources/SudachiSwift/SudachiSwift.swift (flag "swift", from
+# `swift test --enable-code-coverage` in the test job).
+# Check changes before committing:
+#   curl --data-binary @codecov.yml https://codecov.io/validate
+
+# Notify (statuses, PR comment) once per commit, after both uploads: without
+# this, Codecov notifies after the first upload and edits everything after
+# the second. With it, nothing is posted until the coverage job's last step
+# runs the CLI's send-notifications, which it does even when the Swift report
+# is missing. Remove this line together with that step.
+codecov:
+  notify:
+    manual_trigger: true
+
+# Informational for now: the statuses never fail, so no PR (including the
+# automated sudachi.rs bumps) is blocked on coverage. Tighten later, e.g.
+# `threshold: 1%` on project.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# Regular expressions matched against repo-relative paths. The reports only
+# name the two files above; these keep anything else out if that changes.
+ignore:
+  - "Sources/SudachiSwift/sudachi_swift\\.swift"  # generated UniFFI bindings
+  - "sudachi\\.rs"                                # upstream submodule
+  - "Examples"
+  - "tests"                                       # Swift tests, SPM consumer fixture
+  - "scripts"
+
+# One flag per report. carryforward keeps the last Swift numbers on commits
+# where only the Rust report arrives (the test job failed, for example).
+flag_management:
+  default_rules:
+    carryforward: true
+  individual_flags:
+    - name: rust
+      paths:
+        - rust/src/
+    - name: swift
+      paths:
+        - Sources/SudachiSwift/
+
+component_management:
+  individual_components:
+    - component_id: rust_wrapper
+      name: Rust wrapper (UniFFI)
+      paths:
+        - rust/src/**
+    - component_id: swift_extensions
+      name: Swift extensions
+      paths:
+        - Sources/SudachiSwift/SudachiSwift.swift
+
+comment:
+  layout: "condensed_header, condensed_files, condensed_footer"
+  behavior: default       # edit one comment instead of posting new ones
+  require_changes: true   # stay quiet on PRs that don't change coverage
+
+# Line annotations on the PR diff: Codecov is deprecating them, and they
+# don't work with flags or components anyway.
+github_checks:
+  annotations: false
